@@ -1,0 +1,36 @@
+{
+  "policies": {
+    "Certificates": {
+      "Install": ["/usr/share/ca-certificates/burpCA.der"]
+    },
+    "DisplayBookmarksToolbar": true,
+    "NoDefaultBookmarks": true,
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": "",
+    "Homepage": {
+      "URL": "file:///usr/share/kali-defaults/web/homepage.html",
+      "Locked": false,
+      "StartPage": "homepage"
+    },
+    "DisableTelemetry": true,
+    "Extensions": {
+      "Install": [
+      "https://addons.mozilla.org/firefox/downloads/latest/wappalyzer/latest.xpi",
+      "https://addons.mozilla.org/firefox/downloads/latest/foxyproxy-standard/latest.xpi"
+      ]
+    },
+    "NetworkPrediction": false,
+    "DNSOverHTTPS": {
+      "Enabled": false
+    },
+    "CaptivePortal": false,
+    "FirefoxHome": {
+      "Search": true,
+      "TopSites": true,
+      "Highlights": false,
+      "Pocket": false,
+      "Snippets": false,
+      "Locked": false
+    }
+  }
+}
