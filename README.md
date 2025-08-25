@@ -12,8 +12,8 @@ Script to weaponize Kali Linux with tools and configurations.
 **This works on a fresh Kali Linux installation**
 
 ```bash
-git clone <URL>
-cd kali-weaponizer
+git clone https://github.com/P-ict0/Kali-Weaponizer
+cd Kali-Weaponizer
 chmod +x weaponize.sh
 ./weaponize.sh
 ```
