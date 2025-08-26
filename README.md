@@ -21,7 +21,7 @@ chmod +x weaponize.sh
 # 📜 Features
 
 - Update and upgrade Kali Linux
-- Install tools in their own environment
+- Install tools
 - Setup system configurations (aliases, etc...)
 
 # 🛠️ Configurations
@@ -38,6 +38,7 @@ chmod +x weaponize.sh
 
 # 🧰 Tools
 
+- APT packages
 - Bloodhound
 - Burp Suite
     - Extracts CA certificate
