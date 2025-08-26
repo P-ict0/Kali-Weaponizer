@@ -177,7 +177,6 @@ sudo timedatectl set-timezone Europe/Amsterdam
 
 # Create folders
 info "Creating needed folders"
-mkdir -p "$HOME/.msf4"
 sudo mkdir -p /usr/share/ca-certificates
 mkdir -p "$HOME/tools/bin"
 mkdir -p "$HOME/tools/repos"
