@@ -371,6 +371,15 @@ info "Installing SharpCollection"
 sudo git clone https://github.com/Flangvik/SharpCollection /opt/sharpcollection
 sudo chown -R "$USER":"$USER" /opt/sharpcollection
 
+## PEASS-NG
+info "Fetching PEASS-NG (linpeas + winPEASany)"
+sudo mkdir -p /opt/PEASS-ng
+sudo chown -R "$USER":"$USER" /opt/PEASS-ng
+wget https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh -O /opt/PEASS-ng/linpeas.sh
+wget https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEASany.exe -O /opt/PEASS-ng/winPEASany.exe
+chmod +x /opt/PEASS-ng/linpeas.sh
+chmod +x /opt/PEASS-ng/winPEASany.exe
+
 ## Extracting rockyou.txt
 info "Extracting rockyou.txt"
 if [ -f /usr/share/wordlists/rockyou.txt.gz ]; then
