@@ -56,16 +56,31 @@ chmod +x weaponize.sh
     - Generates certificates
 - Sublime Text
 - DonPAPI
-- PayloadsAllTheThings
-- SecLists
-- SharpCollection
+- PayloadsAllTheThings (in `/opt`)
+- SecLists (in `/opt`)
+- SharpCollection (in `/opt`)
+- PEASS-NG (in `/opt`)
+- Mimikatz (in `/opt`)
 - Tmux
     - Also sets up configuration to enable mouse scrolling, copy-pasting, etc...
+    - To activate, once in TMUX: `Ctrl+a` followed by `I`.
+
+
+# 🛠️ Quick reference
+
+- Impacket: Don't run `impacket-<tool>`, use `<tool>.py`.
+- BloodHound CE: `cd ~/tools/repos/BloodHoundCE && docker compose up -d`.
+- Wordlists, and useful binaries: in `/opt`.
+- Post‑install: `~/tools_to_download.txt`.
+- Tool locations:
+    - Repos: `~/tools/repos/`.
+    - Binaries: `~/tools/bin/` (added to PATH).
 
 
 # 📝 Aliases and useful commands
 
 Aliases are part of another repository of mine, have a look over there for reference:
+
 https://github.com/P-ict0/PentestManager
 
 
@@ -74,17 +89,6 @@ They include things like:
 - Extract ports from nmap output
 - Initialize a directory for a new target with directories for notes, exploits, loot, etc...
 - Aliases to setup virtual environments for Python
-
-
-# 🛠️ Quick reference
-
-- Impacket scripts: Don't run `impacket-<tool>`, use `<tool>.py`.
-- Start BloodHound CE: `cd ~/tools/repos/BloodHoundCE && docker compose up -d`.
-- Wordlists location: `/usr/share/wordlists`, `/opt/seclists`, `/opt/payloadsallthethings`.
-- Post‑install notes: `~/tools_to_download.txt`.
-- Tool locations: Nearly all tools installed are in their `dev` versions, taken from their respective repositories.
-    - Repos: By default in `~/tools/repos/`
-    - Binaries: Symlinks in `~/tools/bin/` (added to PATH)
 
 
 # ✏️ Customization
