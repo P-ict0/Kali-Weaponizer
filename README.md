@@ -39,7 +39,6 @@ chmod +x weaponize.sh
 # 🧰 Tools
 
 - Bloodhound
-- AutoRecon
 - Burp Suite
     - Extracts CA certificate
 - Firefox
