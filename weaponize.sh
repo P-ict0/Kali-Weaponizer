@@ -380,6 +380,13 @@ wget https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEASany.ex
 chmod +x /opt/PEASS-ng/linpeas.sh
 chmod +x /opt/PEASS-ng/winPEASany.exe
 
+## Mimikatz
+info "Fetching Mimikatz"
+sudo mkdir -p /opt/mimikatz
+sudo chown -R "$USER":"$USER" /opt/mimikatz
+wget https://github.com/gentilkiwi/mimikatz/releases/latest/download/mimikatz_trunk.zip -O /opt/mimikatz/mimikatz.zip
+unzip /opt/mimikatz/mimikatz.zip -d /opt/mimikatz
+
 ## Extracting rockyou.txt
 info "Extracting rockyou.txt"
 if [ -f /usr/share/wordlists/rockyou.txt.gz ]; then
@@ -412,9 +419,6 @@ output_file="$HOME/tools_to_download.txt"
 # Write to the file
 echo "Other tools you can install manually:" > "$output_file"
 echo "  Recommended:" >> "$output_file"
-echo "    - MimiKatz: https://github.com/gentilkiwi/mimikatz.git" >> "$output_file"
-echo "    - PEASS-NG: https://github.com/carlospolop/PEASS-ng" >> "$output_file"
-echo "  Other:" >> "$output_file"
 echo "  - Hoaxshell: https://github.com/t3l3machus/hoaxshell" >> "$output_file"
 echo "  - Krbrelayx: https://github.com/dirkjanm/krbrelayx" >> "$output_file"
 echo "  - Ntdsxtract: https://github.com/csababarta/ntdsxtract" >> "$output_file"
