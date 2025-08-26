@@ -74,3 +74,29 @@ They include things like:
 - Extract ports from nmap output
 - Initialize a directory for a new target with directories for notes, exploits, loot, etc...
 - Aliases to setup virtual environments for Python
+
+
+# 🛠️ Quick reference
+
+- Impacket scripts: Don't run `impacket-<tool>`, use `<tool>.py`.
+- Start BloodHound CE: `cd ~/tools/repos/BloodHoundCE && docker compose up -d`.
+- Wordlists location: `/usr/share/wordlists`, `/opt/seclists`, `/opt/payloadsallthethings`.
+- Post‑install notes: `~/tools_to_download.txt`.
+- Tool locations: Nearly all tools installed are in their `dev` versions, taken from their respective repositories.
+    - Repos: By default in `~/tools/repos/`
+    - Binaries: Symlinks in `~/tools/bin/` (added to PATH)
+
+
+# ✏️ Customization
+
+In `weaponize.sh`:
+
+- Timezone: change Europe/Amsterdam to your zone in `timedatectl set-timezone`.
+- Locale: adjust en_US.UTF-8 as needed (`/etc/locale.gen`, `update-locale`).
+- DNS: remove/alter the two `nameserver` tee lines.
+- APT sources: replace the `KALI_LINE` with your preferred sources (or skip the whole block).
+- APT packages: add or remove packages as needed.
+- Tools: Add or remove blocks as needed.
+
+In the templates:
+- TMUX/Firefox configuration: adjust settings in `./templates/configurations/`.
