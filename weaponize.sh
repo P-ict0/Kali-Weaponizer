@@ -154,6 +154,7 @@ PACKAGES_TO_INSTALL=(
     freerdp3-x11
     apache2
     neovim
+    nikto
 )
 PACKAGES_TO_INSTALL_NONINTERACTIVE=(
     krb5-user
