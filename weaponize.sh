@@ -214,31 +214,31 @@ ZSHRC="$HOME/.zshrc"
 mkdir -p "$(dirname "$PM_DIR")"
 # Install/update repo
 if [[ -d "$PM_DIR/.git" ]]; then
-  info "PentestManager already installed. Updating..."
-  git -C "$PM_DIR" pull --ff-only
+    info "PentestManager already installed. Updating..."
+    git -C "$PM_DIR" pull --ff-only
 else
-  info "Cloning PentestManager into $PM_DIR"
-  git clone "$PM_REPO_URL" "$PM_DIR"
+    info "Cloning PentestManager into $PM_DIR"
+    git clone "$PM_REPO_URL" "$PM_DIR"
 fi
 
 # Backup zshrc once
 if [[ -f "$ZSHRC" && ! -f "$ZSHRC.bak_pentestmanager" ]]; then
-  info "Backing up ~/.zshrc to ~/.zshrc.bak_pentestmanager"
-  cp "$ZSHRC" "$ZSHRC.bak_pentestmanager"
+    info "Backing up ~/.zshrc to ~/.zshrc.bak_pentestmanager"
+    cp "$ZSHRC" "$ZSHRC.bak_pentestmanager"
 fi
 
 # Add loader snippet if missing
 LOADER_MARKER="# PentestManager (autoload)"
 if ! grep -qF "$LOADER_MARKER" "$ZSHRC" 2>/dev/null; then
-  info "Adding PentestManager loader to ~/.zshrc"
-  cat <<'EOL' >> "$ZSHRC"
+    info "Adding PentestManager loader to ~/.zshrc"
+    cat <<'EOL' >> "$ZSHRC"
 
 # PentestManager (autoload)
 [[ -o interactive ]] || return
 source "${XDG_CONFIG_HOME:-$HOME/.config}/PentestManager/src/init.zsh"
 EOL
 else
-  info "Loader already present in ~/.zshrc"
+    info "Loader already present in ~/.zshrc"
 fi
 
 info "Setting up pipx"
