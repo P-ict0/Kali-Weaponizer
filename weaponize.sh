@@ -205,16 +205,40 @@ fi
 rm -f "$TMP_SUDOERS"
 
 # ZSH config
-info "Setting up zsh and aliases"
-ALIAS_URL="https://raw.githubusercontent.com/P-ict0/PentestManager/main/pentest_aliases.sh"
-wget "$ALIAS_URL" -O "$HOME/.zsh_aliases"
+info "Setting up zsh and PentestManager"
+PM_REPO_URL="https://github.com/P-ict0/PentestManager.git"
+PM_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/PentestManager"
+ZSHRC="$HOME/.zshrc"
 
-if ! grep -qF '[ -f "$HOME/.zsh_aliases" ]' "$HOME/.zshrc"; then
-cat <<'EOL' >> "$HOME/.zshrc"
-if [ -f "$HOME/.zsh_aliases" ]; then
-    . "$HOME/.zsh_aliases"
+# Ensure config dir exists
+mkdir -p "$(dirname "$PM_DIR")"
+# Install/update repo
+if [[ -d "$PM_DIR/.git" ]]; then
+  info "PentestManager already installed. Updating..."
+  git -C "$PM_DIR" pull --ff-only
+else
+  info "Cloning PentestManager into $PM_DIR"
+  git clone "$PM_REPO_URL" "$PM_DIR"
 fi
+
+# Backup zshrc once
+if [[ -f "$ZSHRC" && ! -f "$ZSHRC.bak_pentestmanager" ]]; then
+  info "Backing up ~/.zshrc to ~/.zshrc.bak_pentestmanager"
+  cp "$ZSHRC" "$ZSHRC.bak_pentestmanager"
+fi
+
+# Add loader snippet if missing
+LOADER_MARKER="# PentestManager (autoload)"
+if ! grep -qF "$LOADER_MARKER" "$ZSHRC" 2>/dev/null; then
+  info "Adding PentestManager loader to ~/.zshrc"
+  cat <<'EOL' >> "$ZSHRC"
+
+# PentestManager (autoload)
+[[ -o interactive ]] || return
+source "${XDG_CONFIG_HOME:-$HOME/.config}/PentestManager/src/init.zsh"
 EOL
+else
+  info "Loader already present in ~/.zshrc"
 fi
 
 info "Setting up pipx"
