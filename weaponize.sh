@@ -46,15 +46,34 @@ ensure_kali_sources() {
     local suite="${KALI_SUITE:-kali-rolling}"
     local line="deb http://http.kali.org/kali ${suite} main contrib non-free non-free-firmware"
     local list_file="/etc/apt/sources.list.d/kali-weaponizer.list"
+    local source_file
+    local repo_regex="^[[:space:]]*deb[[:space:]].*http://http\.kali\.org/kali[[:space:]]+${suite}[[:space:]]"
 
     if [[ "${SKIP_KALI_SOURCES:-0}" == "1" ]]; then
         warn "Skipping Kali source management because SKIP_KALI_SOURCES=1."
         return 0
     fi
 
-    if grep -RhsE "^[[:space:]]*deb[[:space:]].*http://http\.kali\.org/kali[[:space:]]+${suite}[[:space:]]" \
-        /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null | grep -q .; then
-        warn "Kali ${suite} repository is already configured; not adding duplicate source."
+    # If Kali is already configured outside this script's managed file, do not add another identical repo.
+    for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [[ -f "$source_file" ]] || continue
+        [[ "$source_file" == "$list_file" ]] && continue
+
+        if grep -qE "$repo_regex" "$source_file"; then
+            warn "Kali ${suite} repository is already configured in $source_file; not adding duplicate source."
+
+            # Clean up the duplicate file created by earlier versions of this script.
+            if [[ -f "$list_file" ]] && grep -qF "$line" "$list_file"; then
+                run_sudo rm -f "$list_file"
+                warn "Removed duplicate source file: $list_file"
+            fi
+            return 0
+        fi
+    done
+
+    # If this script's managed source already exists and no duplicate was found elsewhere, keep it.
+    if [[ -f "$list_file" ]] && grep -qF "$line" "$list_file"; then
+        warn "Kali ${suite} repository is already configured in $list_file."
         return 0
     fi
 
