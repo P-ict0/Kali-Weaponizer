@@ -1,23 +1,161 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -euo pipefail
+set -Eeuo pipefail
 IFS=$'\n\t'
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+cd "$SCRIPT_DIR"
+
+LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/kali-weaponizer"
+mkdir -p "$LOG_DIR"
+
+trap 'echo "[!] Error on line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 # Function to print steps
 info() {
-    SLEEP_TIME=1
-    local message="[+] $1  "  # Two spaces added after the message
+    local message="[+] $1  "
     local green='\e[32m'
     local reset='\e[0m'
-    local cols=$(tput cols)
+    local cols=80
+    if command -v tput >/dev/null 2>&1 && tput cols >/dev/null 2>&1; then
+        cols="$(tput cols)"
+    fi
     local message_length=${#message}
-    local num_hashes=$((cols - message_length))
+    local num_hashes=$(( cols > message_length ? cols - message_length : 0 ))
 
-    # Print the message in green and fill the rest of the line with green '#'
     echo -e "\n\n"
     echo -e "${green}${message}$(printf '%*s' "$num_hashes" | tr ' ' '#')${reset}"
-    sleep $SLEEP_TIME
+    sleep "${SLEEP_TIME:-1}"
+}
+
+warn() {
+    echo "[!] $*" >&2
+}
+
+run_sudo() {
+    sudo "$@"
+}
+
+have_systemd() {
+    command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
+ensure_kali_sources() {
+    # Defaults to kali-rolling because this script installs current packages.
+    # Override with KALI_SUITE=kali-last-snapshot if you intentionally want the point-release snapshot.
+    local suite="${KALI_SUITE:-kali-rolling}"
+    local line="deb http://http.kali.org/kali ${suite} main contrib non-free non-free-firmware"
+    local list_file="/etc/apt/sources.list.d/kali-weaponizer.list"
+
+    if [[ "${SKIP_KALI_SOURCES:-0}" == "1" ]]; then
+        warn "Skipping Kali source management because SKIP_KALI_SOURCES=1."
+        return 0
+    fi
+
+    if [[ -f /etc/apt/sources.list && ! -f /etc/apt/sources.list.bak ]]; then
+        run_sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak || true
+    fi
+
+    echo "$line" | run_sudo tee "$list_file" >/dev/null
+}
+
+apt_update() {
+    run_sudo apt-get update
+}
+
+apt_available() {
+    apt-cache show "$1" >/dev/null 2>&1
+}
+
+filter_available_packages() {
+    local pkg
+    for pkg in "$@"; do
+        if apt_available "$pkg"; then
+            printf '%s\n' "$pkg"
+        else
+            warn "APT package not available in enabled repositories, skipping: $pkg"
+            printf '%s\n' "$pkg" >> "$LOG_DIR/skipped-apt-packages.log"
+        fi
+    done
+}
+
+apt_install_available() {
+    local packages=("$@")
+    local available=()
+    mapfile -t available < <(filter_available_packages "${packages[@]}")
+    if (( ${#available[@]} > 0 )); then
+        run_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${available[@]}"
+    else
+        warn "No packages from this set are available."
+    fi
+}
+
+apt_purge_installed_patterns() {
+    local patterns=("$@")
+    local installed=()
+    local pattern
+
+    for pattern in "${patterns[@]}"; do
+        while IFS= read -r pkg; do
+            [[ -n "$pkg" ]] && installed+=("$pkg")
+        done < <(dpkg-query -W -f='${binary:Package}\n' "$pattern" 2>/dev/null || true)
+    done
+
+    if (( ${#installed[@]} > 0 )); then
+        run_sudo env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${installed[@]}"
+    else
+        warn "No matching installed packages to purge."
+    fi
+}
+
+clone_or_update() {
+    local repo_url="$1"
+    local dest="$2"
+    local owner="${3:-$USER:$(id -gn)}"
+
+    if [[ "$dest" == /opt/* && -e "$dest" ]]; then
+        run_sudo chown -R "$owner" "$dest" || true
+    fi
+
+    if [[ -d "$dest/.git" ]]; then
+        git -C "$dest" pull --ff-only
+    elif [[ -e "$dest" ]]; then
+        warn "$dest exists and is not a git repository; leaving it untouched."
+        return 0
+    else
+        if [[ "$dest" == /opt/* ]]; then
+            run_sudo git clone "$repo_url" "$dest"
+        else
+            git clone "$repo_url" "$dest"
+        fi
+    fi
+
+    if [[ "$dest" == /opt/* ]]; then
+        run_sudo chown -R "$owner" "$dest"
+    fi
+}
+
+pipx_install_force() {
+    local spec="$1"
+    PIPX_HOME="$HOME/tools/pipx" \
+    PIPX_BIN_DIR="$HOME/tools/bin" \
+    PIPX_MAN_DIR="$HOME/tools/pipx/man" \
+        pipx install --force --include-deps "$spec"
+}
+
+install_docker_from_kali() {
+    info "Installing Docker from Kali packages"
+    apt_install_available docker.io docker-compose
+
+    if have_systemd; then
+        run_sudo systemctl enable --now docker || warn "Could not enable/start Docker."
+    else
+        warn "systemd is not available; Docker service was installed but not started."
+    fi
+
+    if getent group docker >/dev/null 2>&1; then
+        run_sudo usermod -aG docker "$USER" || true
+    fi
 }
 
 # Display ASCII art
@@ -49,29 +187,29 @@ echo -e "\n\n"
 info "Prompting for sudo password"
 sudo -v
 
+# Keep sudo alive while the script runs.
+while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done 2>/dev/null &
+SUDO_KEEPALIVE_PID=$!
+trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
+
 # DNS
-info "Setting up google DNS"
-if ! grep -q "nameserver 8.8.8.8" /etc/resolv.conf; then
-    echo "nameserver 8.8.8.8 # Google" | sudo tee -a /etc/resolv.conf > /dev/null
-fi
-if ! grep -q "nameserver 8.8.4.4" /etc/resolv.conf; then
-    echo "nameserver 8.8.4.4 # Google" | sudo tee -a /etc/resolv.conf > /dev/null
+info "Setting up Google DNS"
+if [[ -w /etc/resolv.conf || -n "$(sudo -n true 2>/dev/null && echo yes || true)" ]]; then
+    if ! grep -q "nameserver 8.8.8.8" /etc/resolv.conf 2>/dev/null; then
+        echo "nameserver 8.8.8.8 # Google" | run_sudo tee -a /etc/resolv.conf > /dev/null || warn "Could not update /etc/resolv.conf"
+    fi
+    if ! grep -q "nameserver 8.8.4.4" /etc/resolv.conf 2>/dev/null; then
+        echo "nameserver 8.8.4.4 # Google" | run_sudo tee -a /etc/resolv.conf > /dev/null || warn "Could not update /etc/resolv.conf"
+    fi
 fi
 
 # Setup sources.list
-info "Setting up sources.list"
-if [ ! -f /etc/apt/sources.list.bak ]; then
-    sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak || true
-fi
-
-KALI_LINE="deb http://http.kali.org/kali kali-last-snapshot main contrib non-free non-free-firmware"
-if ! grep -qF "$KALI_LINE" /etc/apt/sources.list; then
-    echo "$KALI_LINE" | sudo tee /etc/apt/sources.list >/dev/null
-fi
+info "Setting up Kali apt source"
+ensure_kali_sources
 
 # Update packages
 info "Updating packages"
-sudo apt update
+apt_update
 
 # Remove packages to install them later
 PACKAGES_TO_REMOVE=(
@@ -81,25 +219,24 @@ PACKAGES_TO_REMOVE=(
     bloodhound.py
     certipy-ad
     responder
-    openjdk*
-    oracle-java*
+    'openjdk*'
+    'oracle-java*'
     java-common
     netexec
     postgresql
 )
-info "Removing packages with apt"
-sudo apt remove --purge -y "${PACKAGES_TO_REMOVE[@]}"
+info "Removing conflicting packages with apt"
+apt_purge_installed_patterns "${PACKAGES_TO_REMOVE[@]}"
 
 # Update packages
 info "Upgrading packages"
-sudo apt full-upgrade -y
+run_sudo env DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
 info "Autoremoving packages"
-sudo apt autoremove -y
+run_sudo env DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
 info "Autocleaning packages"
-sudo apt autoclean -y
+run_sudo apt-get autoclean -y
 
 # Install packages
-
 PACKAGES_TO_INSTALL=(
     nmap
     masscan
@@ -108,6 +245,7 @@ PACKAGES_TO_INSTALL=(
     smbclient
     ncat
     wireshark
+    wireshark-common
     asciinema
     enum4linux
     exploitdb
@@ -118,8 +256,18 @@ PACKAGES_TO_INSTALL=(
     autoconf
     automake
     autopoint
+    build-essential
+    ca-certificates
+    curl
+    git
+    gnupg
     libtool
     pkg-config
+    make
+    unzip
+    wget
+    xclip
+    ruby
     realtek-rtl88xxau-dkms
     ipcalc
     eyewitness
@@ -130,9 +278,11 @@ PACKAGES_TO_INSTALL=(
     jq
     evil-winrm
     htop
-    openjdk-25-jdk
+    default-jdk
+    openjdk-21-jdk
     pipx
     python3
+    python3-dev
     python3-venv
     python3-pip
     golang
@@ -140,8 +290,8 @@ PACKAGES_TO_INSTALL=(
     zenity
     metasploit-framework
     eza
-    postgresql-17
-    postgresql-client-17
+    postgresql
+    postgresql-client
     hashcat
     wordlists
     rlwrap
@@ -150,7 +300,6 @@ PACKAGES_TO_INSTALL=(
     webshells
     silversearcher-ag
     cupp
-    python2-minimal
     freerdp3-x11
     apache2
     neovim
@@ -159,32 +308,45 @@ PACKAGES_TO_INSTALL=(
 PACKAGES_TO_INSTALL_NONINTERACTIVE=(
     krb5-user
 )
-info "Instaling needed packages"
-sudo apt install -y "${PACKAGES_TO_INSTALL[@]}"
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${PACKAGES_TO_INSTALL_NONINTERACTIVE[@]}"
 
-## Wireshark configuration
+info "Preseeding Wireshark capture setting"
+echo "wireshark-common wireshark-common/install-setuid boolean true" | run_sudo debconf-set-selections || true
+
+info "Installing needed packages"
+: > "$LOG_DIR/skipped-apt-packages.log"
+apt_install_available "${PACKAGES_TO_INSTALL[@]}"
+apt_install_available "${PACKAGES_TO_INSTALL_NONINTERACTIVE[@]}"
+
+# Wireshark configuration
 info "Enabling Wireshark non-root capture"
-sudo usermod -aG wireshark "$USER" || true
+if getent group wireshark >/dev/null 2>&1; then
+    run_sudo usermod -aG wireshark "$USER" || true
+else
+    warn "wireshark group not found; skipping usermod."
+fi
 
 # Install virtualbox-guest-x11
 info "Installing virtualbox-guest-x11"
-sudo apt install -y --reinstall virtualbox-guest-x11
-
+apt_install_available virtualbox-guest-x11
+run_sudo apt-get install -y --reinstall virtualbox-guest-x11 || warn "virtualbox-guest-x11 reinstall skipped/failed."
 
 # Set timezone
 info "Setting timezone to Amsterdam"
-sudo timedatectl set-timezone Europe/Amsterdam
+if have_systemd && command -v timedatectl >/dev/null 2>&1; then
+    run_sudo timedatectl set-timezone Europe/Amsterdam
+else
+    warn "timedatectl/systemd is not available; timezone not changed."
+fi
 
 # Create folders
 info "Creating needed folders"
-sudo mkdir -p /usr/share/ca-certificates
-mkdir -p "$HOME/tools/bin"
-mkdir -p "$HOME/tools/repos"
+run_sudo mkdir -p /usr/share/ca-certificates
+mkdir -p "$HOME/tools/bin" "$HOME/tools/repos" "$HOME/tools/pipx/man"
 
-# Add /tools/bin to PATH
+# Add ~/tools/bin to PATH
 info "Adding ~/tools/bin to PATH"
-if ! grep -q "export PATH=\$PATH:$HOME/tools/bin" "$HOME/.zshrc"; then
+touch "$HOME/.zshrc"
+if ! grep -qF "export PATH=\$PATH:$HOME/tools/bin" "$HOME/.zshrc"; then
     echo "export PATH=\$PATH:$HOME/tools/bin" >> "$HOME/.zshrc"
 fi
 
@@ -195,12 +357,11 @@ SUDOERS_D="/etc/sudoers.d/99-tools-bin"
 TMP_SUDOERS="$(mktemp)"
 
 echo "Defaults secure_path=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${USER_HOME}/tools/bin\"" > "$TMP_SUDOERS"
-sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1
-if [ $? -eq 0 ]; then
-    sudo install -m 440 "$TMP_SUDOERS" "$SUDOERS_D"
+if run_sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
+    run_sudo install -m 440 "$TMP_SUDOERS" "$SUDOERS_D"
     echo "Successfully added ${USER_HOME}/tools/bin to secure_path in ${SUDOERS_D}"
 else
-    echo "Error: Invalid sudoers. Change not applied."
+    warn "Invalid sudoers fragment. Change not applied."
 fi
 rm -f "$TMP_SUDOERS"
 
@@ -210,259 +371,260 @@ PM_REPO_URL="https://github.com/P-ict0/PentestManager.git"
 PM_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/PentestManager"
 ZSHRC="$HOME/.zshrc"
 
-# Ensure config dir exists
 mkdir -p "$(dirname "$PM_DIR")"
-# Install/update repo
-if [[ -d "$PM_DIR/.git" ]]; then
-  info "PentestManager already installed. Updating..."
-  git -C "$PM_DIR" pull --ff-only
-else
-  info "Cloning PentestManager into $PM_DIR"
-  git clone "$PM_REPO_URL" "$PM_DIR"
-fi
+clone_or_update "$PM_REPO_URL" "$PM_DIR"
 
-# Backup zshrc once
 if [[ -f "$ZSHRC" && ! -f "$ZSHRC.bak_pentestmanager" ]]; then
-  info "Backing up ~/.zshrc to ~/.zshrc.bak_pentestmanager"
-  cp "$ZSHRC" "$ZSHRC.bak_pentestmanager"
+    info "Backing up ~/.zshrc to ~/.zshrc.bak_pentestmanager"
+    cp "$ZSHRC" "$ZSHRC.bak_pentestmanager"
 fi
 
-# Add loader snippet if missing
 LOADER_MARKER="# PentestManager (autoload)"
 if ! grep -qF "$LOADER_MARKER" "$ZSHRC" 2>/dev/null; then
-  info "Adding PentestManager loader to ~/.zshrc"
-  cat <<'EOL' >> "$ZSHRC"
+    info "Adding PentestManager loader to ~/.zshrc"
+    cat <<'EOL' >> "$ZSHRC"
 
 # PentestManager (autoload)
 [[ -o interactive ]] || return
 source "${XDG_CONFIG_HOME:-$HOME/.config}/PentestManager/src/init.zsh"
 EOL
 else
-  info "Loader already present in ~/.zshrc"
+    info "Loader already present in ~/.zshrc"
 fi
 
 info "Setting up pipx"
 add_line() { grep -qxF "$1" "$HOME/.zshrc" || echo "$1" >> "$HOME/.zshrc"; }
 add_line "export PIPX_HOME='$HOME/tools/pipx'"
 add_line "export PIPX_BIN_DIR='$HOME/tools/bin'"
-add_line "export PIPX_MAN_DIR=/usr/local/share/man"
+add_line "export PIPX_MAN_DIR='$HOME/tools/pipx/man'"
 
 # Ensure a locale exists
-info "Ensure a locale exists"
-if ! grep -q "^en_US.UTF-8 UTF-8" /etc/locale.gen; then
-    echo "en_US.UTF-8 UTF-8" | sudo tee -a /etc/locale.gen > /dev/null
-    sudo locale-gen
+info "Ensuring a locale exists"
+if [[ -f /etc/locale.gen ]] && ! grep -q "^en_US.UTF-8 UTF-8" /etc/locale.gen; then
+    echo "en_US.UTF-8 UTF-8" | run_sudo tee -a /etc/locale.gen > /dev/null
+    run_sudo locale-gen
 fi
 
 # Set locale
 info "Setting locale to en_US.UTF-8"
-sudo update-locale LANG=en_US.UTF-8
+run_sudo update-locale LANG=en_US.UTF-8 || warn "Could not update locale."
 
 # Start and enable PostgreSQL service
-info "Starting and enabling postgresql"
-sudo systemctl enable --now postgresql
-sudo -u postgres psql -c "REINDEX DATABASE postgres;" || true
-sudo -u postgres psql -c "ALTER DATABASE postgres REFRESH COLLATION VERSION;" || true
-
+info "Starting and enabling PostgreSQL"
+if have_systemd; then
+    run_sudo systemctl enable --now postgresql || warn "Could not enable/start PostgreSQL."
+else
+    warn "systemd is not available; PostgreSQL service was not started."
+fi
+if command -v psql >/dev/null 2>&1; then
+    run_sudo -u postgres psql -c "REINDEX DATABASE postgres;" || true
+    run_sudo -u postgres psql -c "ALTER DATABASE postgres REFRESH COLLATION VERSION;" || true
+fi
 
 # Initialize the MSF database
 info "Initializing msfdb"
-sudo /usr/bin/msfdb init
-
-# Tools
-## BloodHound.py
-info "Instaling Bloodhound.py"
-PIPX_HOME="$HOME/tools/pipx" PIPX_BIN_DIR="$HOME/tools/bin" PIPX_MAN_DIR=/usr/local/share/man pipx install git+https://github.com/fox-it/BloodHound.py
-
-## Burpsuite
-info "Instaling BurpSuite"
-sudo apt install -y burpsuite
-chmod +x "./templates/scripts/get-burp-certificate.sh"
-bash "./templates/scripts/get-burp-certificate.sh"
-sudo mv /tmp/burpCA.der /usr/share/ca-certificates/burpCA.der
-pgrep -x java >/dev/null && sudo pkill -x java || true
-sudo cp "./templates/configurations/firefox/firefox_policies.json" /usr/share/firefox-esr/distribution/policies.json
-
-## Certipy
-info "Instaling Certipy"
-PIPX_HOME="$HOME/tools/pipx" PIPX_BIN_DIR="$HOME/tools/bin" PIPX_MAN_DIR=/usr/local/share/man pipx install git+https://github.com/ly4k/Certipy
-
-## Coercer
-info "Instaling Coercer"
-PIPX_HOME="$HOME/tools/pipx" PIPX_BIN_DIR="$HOME/tools/bin" PIPX_MAN_DIR=/usr/local/share/man pipx install git+https://github.com/p0dalirius/Coercer
-
-## Docker
-info "Instaling Docker"
-sudo apt remove -y docker.io docker-doc docker-compose podman-docker containerd runc
-sudo apt update
-sudo apt install -y ca-certificates curl gnupg
-sudo mkdir -p /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/debian/gpg -o /tmp/docker.gpg
-sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg /tmp/docker.gpg
-rm /tmp/docker.gpg
-echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-## BloodHoundCE
-info "Instaling BloodHoundCE"
-mkdir -p "$HOME/tools/repos/BloodHoundCE"
-curl -L https://ghst.ly/getbhce -o "$HOME/tools/repos/BloodHoundCE/docker-compose.yml"
-
-## Impacket
-info "Instaling Impacket"
-PIPX_HOME="$HOME/tools/pipx" PIPX_BIN_DIR="$HOME/tools/bin" PIPX_MAN_DIR=/usr/local/share/man pipx install git+https://github.com/fortra/impacket
-
-## Kerbrute
-info "Instaling Kerbrute"
-git clone https://github.com/ropnop/kerbrute "$HOME/tools/repos/Kerbrute"
-cd "$HOME/tools/repos/Kerbrute"
-make linux
-sudo ln -sf "$HOME/tools/repos/Kerbrute/dist/kerbrute_linux_386" "$HOME/tools/bin/kerbrute"
-sudo chown "$USER":"$USER" "$HOME/tools/bin/kerbrute"
-cd -
-
-## ldapdomaindump
-info "Instaling Ldapdomaindump"
-PIPX_HOME="$HOME/tools/pipx" PIPX_BIN_DIR="$HOME/tools/bin" PIPX_MAN_DIR=/usr/local/share/man pipx install git+https://github.com/dirkjanm/ldapdomaindump
-
-## Mitm6
-info "Instaling Mitm6"
-PIPX_HOME="$HOME/tools/pipx" PIPX_BIN_DIR="$HOME/tools/bin" PIPX_MAN_DIR=/usr/local/share/man pipx install git+https://github.com/dirkjanm/mitm6
-
-## NetExec
-info "Instaling NetExec"
-PIPX_HOME="$HOME/tools/pipx" PIPX_BIN_DIR="$HOME/tools/bin" PIPX_MAN_DIR=/usr/local/share/man pipx install git+https://github.com/Pennyw0rth/NetExec
-
-## Responder
-info "Installing Responder"
-REPO_DIR="$HOME/tools/repos/Responder"
-VENV_DIR="$REPO_DIR/.venv"
-if [ ! -d "$REPO_DIR/.git" ]; then
-    git clone https://github.com/lgandx/Responder "$REPO_DIR"
+if command -v msfdb >/dev/null 2>&1; then
+    run_sudo msfdb init || warn "msfdb init failed or database already exists; continuing."
 else
-    git -C "$REPO_DIR" pull --ff-only
+    warn "msfdb command not found; skipping."
 fi
 
-python3 -m venv "$VENV_DIR"
-source "$VENV_DIR/bin/activate"
+# Tools
+# BloodHound.py
+info "Installing BloodHound.py"
+pipx_install_force git+https://github.com/fox-it/BloodHound.py
+
+# Burp Suite
+info "Installing Burp Suite"
+apt_install_available burpsuite
+chmod +x "./templates/scripts/get-burp-certificate.sh"
+if [[ -f /usr/share/burpsuite/burpsuite.jar ]]; then
+    bash "./templates/scripts/get-burp-certificate.sh" || warn "Could not auto-fetch Burp CA certificate. Start Burp once and export the CA manually if needed."
+    if [[ -s /tmp/burpCA.der ]]; then
+        run_sudo mv /tmp/burpCA.der /usr/share/ca-certificates/burpCA.der
+    fi
+else
+    warn "Burp Suite jar not found; skipping CA extraction."
+fi
+run_sudo mkdir -p /usr/share/firefox-esr/distribution
+run_sudo cp "./templates/configurations/firefox/firefox_policies.json" /usr/share/firefox-esr/distribution/policies.json
+
+# Certipy
+info "Installing Certipy"
+pipx_install_force git+https://github.com/ly4k/Certipy
+
+# Coercer
+info "Installing Coercer"
+pipx_install_force git+https://github.com/p0dalirius/Coercer
+
+# Docker
+install_docker_from_kali
+
+# BloodHound CE
+info "Installing BloodHound CE"
+mkdir -p "$HOME/tools/repos/BloodHoundCE"
+curl -fsSL https://ghst.ly/getbhce -o "$HOME/tools/repos/BloodHoundCE/docker-compose.yml"
+
+# Impacket
+info "Installing Impacket"
+pipx_install_force git+https://github.com/fortra/impacket
+
+# Kerbrute
+info "Installing Kerbrute"
+KERBRUTE_DIR="$HOME/tools/repos/Kerbrute"
+clone_or_update https://github.com/ropnop/kerbrute "$KERBRUTE_DIR"
+make -C "$KERBRUTE_DIR" linux
+KERBRUTE_BIN="$(find "$KERBRUTE_DIR/dist" -type f \( -name 'kerbrute_linux_amd64' -o -name 'kerbrute_linux_x86_64' -o -name 'kerbrute_linux_386' \) | sort | head -n 1)"
+if [[ -n "$KERBRUTE_BIN" ]]; then
+    ln -sf "$KERBRUTE_BIN" "$HOME/tools/bin/kerbrute"
+    chmod +x "$KERBRUTE_BIN"
+else
+    warn "Kerbrute build finished but no Linux binary was found."
+fi
+
+# ldapdomaindump
+info "Installing ldapdomaindump"
+pipx_install_force git+https://github.com/dirkjanm/ldapdomaindump
+
+# Mitm6
+info "Installing Mitm6"
+pipx_install_force git+https://github.com/dirkjanm/mitm6
+
+# NetExec
+info "Installing NetExec"
+pipx_install_force git+https://github.com/Pennyw0rth/NetExec
+
+# Responder
+info "Installing Responder"
+RESPONDER_DIR="$HOME/tools/repos/Responder"
+RESPONDER_VENV="$RESPONDER_DIR/.venv"
+clone_or_update https://github.com/lgandx/Responder "$RESPONDER_DIR"
+
+python3 -m venv "$RESPONDER_VENV"
+# shellcheck disable=SC1091
+source "$RESPONDER_VENV/bin/activate"
 pip install --upgrade pip wheel
-pip install -r "$REPO_DIR/requirements.txt"
+pip install -r "$RESPONDER_DIR/requirements.txt"
 deactivate
 
 cp "./templates/scripts/extract-hashes-responder.sh" "$HOME/tools/bin/extract-hashes-responder"
 chmod +x "$HOME/tools/bin/extract-hashes-responder"
 
-mkdir -p "$REPO_DIR/certs"
-openssl genrsa -out "$REPO_DIR/certs/responder.key" 2048
-sudo openssl req -new -x509 -days 3650 -key "$REPO_DIR/certs/responder.key" -out "$REPO_DIR/certs/responder.crt" -subj "/"
+mkdir -p "$RESPONDER_DIR/certs"
+openssl genrsa -out "$RESPONDER_DIR/certs/responder.key" 2048
+openssl req -new -x509 -days 3650 -key "$RESPONDER_DIR/certs/responder.key" -out "$RESPONDER_DIR/certs/responder.crt" -subj "/"
 
-mkdir -p "$REPO_DIR/bin"
-cat <<EOL | tee "$REPO_DIR/bin/run_responder.sh" > /dev/null
-#!/bin/bash
+mkdir -p "$RESPONDER_DIR/bin"
+cat <<EOL > "$RESPONDER_DIR/bin/run_responder.sh"
+#!/usr/bin/env bash
 source "$HOME/tools/repos/Responder/.venv/bin/activate"
 "$HOME/tools/repos/Responder/.venv/bin/python" "$HOME/tools/repos/Responder/Responder.py" "\${@:1}"
 EOL
-chmod +x "$REPO_DIR/bin/run_responder.sh"
-ln -sf "$REPO_DIR/bin/run_responder.sh" "$HOME/tools/bin/responder"
+chmod +x "$RESPONDER_DIR/bin/run_responder.sh"
+ln -sf "$RESPONDER_DIR/bin/run_responder.sh" "$HOME/tools/bin/responder"
 
-## Sublime Text
+# Sublime Text
 info "Installing Sublime Text"
 curl -fsSL https://download.sublimetext.com/sublimehq-pub.gpg -o /tmp/sublimehq-archive.gpg
-sudo mkdir -p /etc/apt/keyrings
-sudo gpg --dearmor -o /etc/apt/keyrings/sublimehq-archive.gpg /tmp/sublimehq-archive.gpg
-rm /tmp/sublimehq-archive.gpg
-echo "deb [signed-by=/etc/apt/keyrings/sublimehq-archive.gpg] https://download.sublimetext.com/ apt/stable/" | sudo tee /etc/apt/sources.list.d/sublime-text.list > /dev/null
-sudo apt update
-sudo apt install -y sublime-text hunspell-en-us
+run_sudo mkdir -p /etc/apt/keyrings
+run_sudo gpg --dearmor --yes -o /etc/apt/keyrings/sublimehq-archive.gpg /tmp/sublimehq-archive.gpg
+rm -f /tmp/sublimehq-archive.gpg
+echo "deb [signed-by=/etc/apt/keyrings/sublimehq-archive.gpg] https://download.sublimetext.com/ apt/stable/" | run_sudo tee /etc/apt/sources.list.d/sublime-text.list > /dev/null
+apt_update
+apt_install_available sublime-text hunspell-en-us
 
-## DonPAPI
+# DonPAPI
 info "Installing DonPAPI"
-PIPX_HOME="$HOME/tools/pipx" PIPX_BIN_DIR="$HOME/tools/bin" PIPX_MAN_DIR=/usr/local/share/man pipx install git+https://github.com/login-securite/DonPAPI.git
+pipx_install_force git+https://github.com/login-securite/DonPAPI.git
 
-## PayloadsAllTheThings
+# PayloadsAllTheThings
 info "Installing PayloadsAllTheThings"
-sudo git clone https://github.com/swisskyrepo/PayloadsAllTheThings /opt/payloadsallthethings
-sudo chown -R "$USER":"$USER" /opt/payloadsallthethings
+clone_or_update https://github.com/swisskyrepo/PayloadsAllTheThings /opt/payloadsallthethings
 
-## SecLists
+# SecLists
 info "Installing SecLists"
-sudo git clone https://github.com/danielmiessler/SecLists /opt/seclists
-sudo chown -R "$USER":"$USER" /opt/seclists
+clone_or_update https://github.com/danielmiessler/SecLists /opt/seclists
 
-## SharpCollection
+# SharpCollection
 info "Installing SharpCollection"
-sudo git clone https://github.com/Flangvik/SharpCollection /opt/sharpcollection
-sudo chown -R "$USER":"$USER" /opt/sharpcollection
+clone_or_update https://github.com/Flangvik/SharpCollection /opt/sharpcollection
 
-## PEASS-NG
+# PEASS-NG
 info "Fetching PEASS-NG"
-sudo mkdir -p /opt/PEASS-ng
-sudo chown -R "$USER":"$USER" /opt/PEASS-ng
-wget https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh -O /opt/PEASS-ng/linpeas.sh
-wget https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEASany.exe -O /opt/PEASS-ng/winPEASany.exe
+run_sudo mkdir -p /opt/PEASS-ng
+run_sudo chown -R "$USER:$USER" /opt/PEASS-ng
+curl -fL https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh -o /opt/PEASS-ng/linpeas.sh
+curl -fL https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEASany.exe -o /opt/PEASS-ng/winPEASany.exe
+chmod +x /opt/PEASS-ng/linpeas.sh
 
-## Mimikatz
+# Mimikatz
 info "Fetching Mimikatz"
-sudo mkdir -p /opt/mimikatz
-sudo chown -R "$USER":"$USER" /opt/mimikatz
-wget https://github.com/gentilkiwi/mimikatz/releases/latest/download/mimikatz_trunk.zip -O /opt/mimikatz/mimikatz.zip
-unzip /opt/mimikatz/mimikatz.zip -d /opt/mimikatz
+run_sudo mkdir -p /opt/mimikatz
+run_sudo chown -R "$USER:$USER" /opt/mimikatz
+curl -fL https://github.com/gentilkiwi/mimikatz/releases/latest/download/mimikatz_trunk.zip -o /opt/mimikatz/mimikatz.zip
+unzip -oq /opt/mimikatz/mimikatz.zip -d /opt/mimikatz
 
-## Extracting rockyou.txt
+# Extracting rockyou.txt
 info "Extracting rockyou.txt"
-if [ -f /usr/share/wordlists/rockyou.txt.gz ]; then
-    sudo gzip -d -k /usr/share/wordlists/rockyou.txt.gz
+if [[ -f /usr/share/wordlists/rockyou.txt.gz && ! -f /usr/share/wordlists/rockyou.txt ]]; then
+    run_sudo gzip -dk /usr/share/wordlists/rockyou.txt.gz
 fi
 
-## Install username-anarchy
+# Install username-anarchy
 info "Installing username-anarchy"
-git clone https://github.com/urbanadventurer/username-anarchy.git "$HOME/tools/repos/username-anarchy"
-ln -sf "$HOME/tools/repos/username-anarchy/username-anarchy" "$HOME/tools/bin/username-anarchy"
+USERNAME_ANARCHY_DIR="$HOME/tools/repos/username-anarchy"
+clone_or_update https://github.com/urbanadventurer/username-anarchy.git "$USERNAME_ANARCHY_DIR"
+ln -sf "$USERNAME_ANARCHY_DIR/username-anarchy" "$HOME/tools/bin/username-anarchy"
 
-## Tmux
+# Tmux
 info "Installing Tmux"
-sudo apt update
-sudo apt install -y tmux
-if [ ! -d "$HOME/.tmux/plugins/tpm/.git" ]; then
-  git clone https://github.com/tmux-plugins/tpm "$HOME/.tmux/plugins/tpm"
+apt_update
+apt_install_available tmux
+if [[ ! -d "$HOME/.tmux/plugins/tpm/.git" ]]; then
+    git clone https://github.com/tmux-plugins/tpm "$HOME/.tmux/plugins/tpm"
 else
-  git -C "$HOME/.tmux/plugins/tpm" pull --ff-only
+    git -C "$HOME/.tmux/plugins/tpm" pull --ff-only
 fi
 cp "./templates/configurations/tmux/tmux.conf" "$HOME/.tmux.conf"
 
 # Pipx setup path
 info "Setting up pipx path"
-PIPX_HOME="$HOME/tools/pipx" PIPX_BIN_DIR="$HOME/tools/bin" PIPX_MAN_DIR=/usr/local/share/man pipx ensurepath
+PIPX_HOME="$HOME/tools/pipx" \
+PIPX_BIN_DIR="$HOME/tools/bin" \
+PIPX_MAN_DIR="$HOME/tools/pipx/man" \
+    pipx ensurepath || true
 
 # Define the output file
 output_file="$HOME/tools_to_download.txt"
 
-# Write to the file
-echo "Other tools you can install manually:" > "$output_file"
-echo "  Recommended:" >> "$output_file"
-echo "  - Hoaxshell: https://github.com/t3l3machus/hoaxshell" >> "$output_file"
-echo "  - Krbrelayx: https://github.com/dirkjanm/krbrelayx" >> "$output_file"
-echo "  - Ntdsxtract: https://github.com/csababarta/ntdsxtract" >> "$output_file"
-echo "  - PKINITtools https://github.com/dirkjanm/PKINITtools" >> "$output_file"
-echo "  - Pretender: https://github.com/RedTeamPentesting/pretender" >> "$output_file"
-echo "  - ROADtools: https://github.com/dirkjanm/ROADtools" >> "$output_file"
-echo "  - ROADtools_hybrid https://github.com/dirkjanm/roadtools_hybrid" >> "$output_file"
-echo "  - Adconnectdump: https://github.com/dirkjanm/adconnectdump" >> "$output_file"
-echo "  - LaZagne: https://github.com/AlessandroZ/LaZagne" >> "$output_file"
-echo "  - MFASweep: https://github.com/dafthack/MFASweep" >> "$output_file"
+cat > "$output_file" <<'EOL'
+Other tools you can install manually:
+  Recommended:
+  - Hoaxshell: https://github.com/t3l3machus/hoaxshell
+  - Krbrelayx: https://github.com/dirkjanm/krbrelayx
+  - Ntdsxtract: https://github.com/csababarta/ntdsxtract
+  - PKINITtools https://github.com/dirkjanm/PKINITtools
+  - Pretender: https://github.com/RedTeamPentesting/pretender
+  - ROADtools: https://github.com/dirkjanm/ROADtools
+  - ROADtools_hybrid https://github.com/dirkjanm/roadtools_hybrid
+  - Adconnectdump: https://github.com/dirkjanm/adconnectdump
+  - LaZagne: https://github.com/AlessandroZ/LaZagne
+  - MFASweep: https://github.com/dafthack/MFASweep
+EOL
 
-# Print the list to the console
 echo -e "\n\n\n\n"
 cat "$output_file"
 
 echo -e "\n\n"
 echo "Tool recommendations have been saved to $output_file"
 
+if [[ -s "$LOG_DIR/skipped-apt-packages.log" ]]; then
+    warn "Some APT packages were unavailable and skipped. See: $LOG_DIR/skipped-apt-packages.log"
+fi
+
 info "Shell setup"
-echo "Open a new terminal or 'exec zsh' to load updated PATH and pipx settings."
+echo "Open a new terminal or run 'exec zsh' to load updated PATH and pipx settings."
+echo "If Docker/Wireshark group membership changed, log out and back in before using those features."
 
-
-echo "Setup done!!"
-
+echo "Setup done."
 echo "Happy Hacking :)"
