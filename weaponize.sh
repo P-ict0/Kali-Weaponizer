@@ -52,6 +52,12 @@ ensure_kali_sources() {
         return 0
     fi
 
+    if grep -RhsE "^[[:space:]]*deb[[:space:]].*http://http\.kali\.org/kali[[:space:]]+${suite}[[:space:]]" \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null | grep -q .; then
+        warn "Kali ${suite} repository is already configured; not adding duplicate source."
+        return 0
+    fi
+
     if [[ -f /etc/apt/sources.list && ! -f /etc/apt/sources.list.bak ]]; then
         run_sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak || true
     fi
