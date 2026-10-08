@@ -1,730 +1,454 @@
 #!/usr/bin/env bash
-
+# Kali guest provisioning. Sourcing this file only defines functions for tests.
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-cd "$SCRIPT_DIR"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+MODE=install
+PROFILE=""
+VIRTUALIZATION_PLATFORM=""
+EXTRAS=""
+CONFIGURE_SHELL=0
+SETUP_BLOODHOUND=0
+CHECK_BLOODHOUND=0
+UPGRADE_SYSTEM=0
+REQUIRED_PACKAGES=()
+OPTIONAL_PACKAGES=()
+SKIPPED_PACKAGES=()
+# Fixed source revisions captured on 2026-10-08; update deliberately.
+KERBRUTE_REV=9cfb81e4fab8037acb44c678773ca3f93bc2b39c
+PENTESTMANAGER_REV=1b32d010e8112717a533c0f2126e36539d3c7a7b
+TPM_REV=e261deb1b47614eed3400089ce7197dc68acc4eb
+DONPAPI_REV=4f01e2b893d3dfbc327b68797943cc2f00c5dd94
+PAYLOADS_REV=3ac27901c711bdf3f5b65a7b1d1820a1f65bd09a
+SHARPCOLLECTION_REV=c53d7eb583d853de0bd693c1bb61581d59b2f44e
+USERNAME_ANARCHY_REV=e0631915ee90afb7ffcabf7900043927ef2f8934
 
-LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/kali-weaponizer"
-mkdir -p "$LOG_DIR"
+info() { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+die() { warn "$*"; exit 1; }
+run_sudo() { sudo "$@"; }
+have_systemd() { command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; }
+has_extra() { [[ ",$EXTRAS," == *",$1,"* ]]; }
 
-trap 'echo "[!] Error on line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
+usage() {
+    cat <<'USAGE'
+Usage: bash weaponize.sh [options]
+  --profile core|extra   Prompt if omitted; profiles are additive.
+  --guest qemu|vmware|virtualbox|none
+                           Prompt if omitted during install/update.
+  --extras LIST            Comma-separated: wireless,editors,servers,references
+  --configure-shell        Install pinned PentestManager/TPM; configure zsh/tmux.
+  --update                 Upgrade selected APT tools (source pins stay fixed).
+  --upgrade-system         Also full-upgrade Kali; requires --update.
+  --verify                 Check installed packages and local CLI smoke tests only.
+  --verify-bloodhound       Verify mode plus local BloodHound HTTP readiness.
+  --setup-bloodhound        Run interactive Kali BloodHound setup/start after install.
+  --plan                   Print package selections without writes/sudo/network.
+  -h, --help               Show this help.
 
-# Function to print steps
-info() {
-    local message="[+] $1  "
-    local green='\e[32m'
-    local reset='\e[0m'
-    local cols=80
-    if command -v tput >/dev/null 2>&1 && tput cols >/dev/null 2>&1; then
-        cols="$(tput cols)"
-    fi
-    local message_length=${#message}
-    local num_hashes=$(( cols > message_length ? cols - message_length : 0 ))
-
-    echo -e "\n\n"
-    echo -e "${green}${message}$(printf '%*s' "$num_hashes" | tr ' ' '#')${reset}"
-    sleep "${SLEEP_TIME:-1}"
+Run as your normal user inside Kali, not as root or on the Arch/Windows host.
+None skips guest integrations only; --plan and --verify do not download anything.
+USAGE
 }
 
-warn() {
-    echo "[!] $*" >&2
-}
-
-run_sudo() {
-    sudo "$@"
-}
-
-have_systemd() {
-    command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
-}
-
-ensure_kali_sources() {
-    # Defaults to kali-rolling because this script installs current packages.
-    # Override with KALI_SUITE=kali-last-snapshot if you intentionally want the point-release snapshot.
-    local suite="${KALI_SUITE:-kali-rolling}"
-    local line="deb http://http.kali.org/kali ${suite} main contrib non-free non-free-firmware"
-    local list_file="/etc/apt/sources.list.d/kali-weaponizer.list"
-    local source_file
-    local repo_regex="^[[:space:]]*deb[[:space:]].*http://http\.kali\.org/kali[[:space:]]+${suite}[[:space:]]"
-
-    if [[ "${SKIP_KALI_SOURCES:-0}" == "1" ]]; then
-        warn "Skipping Kali source management because SKIP_KALI_SOURCES=1."
-        return 0
-    fi
-
-    # If Kali is already configured outside this script's managed file, do not add another identical repo.
-    for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
-        [[ -f "$source_file" ]] || continue
-        [[ "$source_file" == "$list_file" ]] && continue
-
-        if grep -qE "$repo_regex" "$source_file"; then
-            warn "Kali ${suite} repository is already configured in $source_file; not adding duplicate source."
-
-            # Clean up the duplicate file created by earlier versions of this script.
-            if [[ -f "$list_file" ]] && grep -qF "$line" "$list_file"; then
-                run_sudo rm -f "$list_file"
-                warn "Removed duplicate source file: $list_file"
-            fi
-            return 0
-        fi
-    done
-
-    # If this script's managed source already exists and no duplicate was found elsewhere, keep it.
-    if [[ -f "$list_file" ]] && grep -qF "$line" "$list_file"; then
-        warn "Kali ${suite} repository is already configured in $list_file."
-        return 0
-    fi
-
-    if [[ -f /etc/apt/sources.list && ! -f /etc/apt/sources.list.bak ]]; then
-        run_sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak || true
-    fi
-
-    echo "$line" | run_sudo tee "$list_file" >/dev/null
-}
-
-apt_update() {
-    run_sudo apt-get update
-}
-
-apt_available() {
-    apt-cache show "$1" >/dev/null 2>&1
-}
-
-filter_available_packages() {
-    local pkg
-    for pkg in "$@"; do
-        if apt_available "$pkg"; then
-            printf '%s\n' "$pkg"
-        else
-            warn "APT package not available in enabled repositories, skipping: $pkg"
-            printf '%s\n' "$pkg" >> "$LOG_DIR/skipped-apt-packages.log"
-        fi
-    done
-}
-
-apt_install_available() {
-    local packages=("$@")
-    local available=()
-    mapfile -t available < <(filter_available_packages "${packages[@]}")
-    if (( ${#available[@]} > 0 )); then
-        run_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${available[@]}"
-    else
-        warn "No packages from this set are available."
-    fi
-}
-
-apt_purge_installed_patterns() {
-    local patterns=("$@")
-    local installed=()
-    local pattern
-
-    for pattern in "${patterns[@]}"; do
-        while IFS= read -r pkg; do
-            [[ -n "$pkg" ]] && installed+=("$pkg")
-        done < <(dpkg-query -W -f='${binary:Package}\n' "$pattern" 2>/dev/null || true)
-    done
-
-    if (( ${#installed[@]} > 0 )); then
-        run_sudo env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${installed[@]}"
-    else
-        warn "No matching installed packages to purge."
-    fi
-}
-
-clone_or_update() {
-    local repo_url="$1"
-    local dest="$2"
-    local owner="${3:-$USER:$(id -gn)}"
-
-    if [[ "$dest" == /opt/* && -e "$dest" ]]; then
-        run_sudo chown -R "$owner" "$dest" || true
-    fi
-
-    if [[ -d "$dest/.git" ]]; then
-        git -C "$dest" pull --ff-only
-    elif [[ -e "$dest" ]]; then
-        warn "$dest exists and is not a git repository; leaving it untouched."
-        return 0
-    else
-        if [[ "$dest" == /opt/* ]]; then
-            run_sudo git clone "$repo_url" "$dest"
-        else
-            git clone "$repo_url" "$dest"
-        fi
-    fi
-
-    if [[ "$dest" == /opt/* ]]; then
-        run_sudo chown -R "$owner" "$dest"
-    fi
-}
-
-pipx_install_force() {
-    local spec="$1"
-    PIPX_HOME="$HOME/tools/pipx" \
-    PIPX_BIN_DIR="$HOME/tools/bin" \
-    PIPX_MAN_DIR="$HOME/tools/pipx/man" \
-        pipx install --force --include-deps "$spec"
-}
-
-install_docker_from_kali() {
-    info "Installing Docker from Kali packages"
-    apt_install_available docker.io docker-compose
-
-    if have_systemd; then
-        run_sudo systemctl enable --now docker || warn "Could not enable/start Docker."
-    else
-        warn "systemd is not available; Docker service was installed but not started."
-    fi
-
-    if getent group docker >/dev/null 2>&1; then
-        run_sudo usermod -aG docker "$USER" || true
-    fi
-}
-
-select_virtualization_platform() {
-    local choice
-
-    echo
-    echo "Select virtualization platform for guest integration:"
-    echo "  1) QEMU/KVM"
-    echo "  2) VMware"
-    echo "  3) VirtualBox"
-    echo "  4) None (skip virtualization guest tools)"
-
-    while true; do
-        read -r -p "Choice [1-4]: " choice
-
-        case "$choice" in
-            1)
-                VIRTUALIZATION_PLATFORM="qemu"
-                return 0
-                ;;
-            2)
-                VIRTUALIZATION_PLATFORM="vmware"
-                return 0
-                ;;
-            3)
-                VIRTUALIZATION_PLATFORM="virtualbox"
-                return 0
-                ;;
-            4)
-                VIRTUALIZATION_PLATFORM="none"
-                return 0
-                ;;
-            *)
-                warn "Invalid selection. Choose 1, 2, 3, or 4."
-                ;;
+parse_args() {
+    while (( $# )); do
+        case "$1" in
+            --profile|--guest|--extras)
+                (( $# >= 2 )) && [[ "$2" != --* ]] || die "Missing value for $1"
+                case "$1" in
+                    --profile) PROFILE="$2" ;;
+                    --guest) VIRTUALIZATION_PLATFORM="$2" ;;
+                    --extras) EXTRAS="$2" ;;
+                esac
+                shift 2 ;;
+            --update|--verify|--verify-bloodhound|--plan)
+                [[ "$MODE" == install ]] || die "Choose one action: update, verify, or plan."
+                case "$1" in
+                    --update) MODE=update ;;
+                    --plan) MODE=plan ;;
+                    --verify) MODE=verify ;;
+                    --verify-bloodhound) MODE=verify; CHECK_BLOODHOUND=1 ;;
+                esac
+                shift ;;
+            --upgrade-system) UPGRADE_SYSTEM=1; shift ;;
+            --setup-bloodhound) SETUP_BLOODHOUND=1; shift ;;
+            --configure-shell) CONFIGURE_SHELL=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "Unknown option: $1" ;;
         esac
     done
+    [[ -z "$PROFILE" || "$PROFILE" =~ ^(core|extra)$ ]] || die "Invalid profile: $PROFILE"
+    [[ -z "$VIRTUALIZATION_PLATFORM" || "$VIRTUALIZATION_PLATFORM" =~ ^(qemu|vmware|virtualbox|none)$ ]] || die "Invalid guest platform"
+    local extra
+    local -a selected_extras=()
+    if [[ -n "$EXTRAS" ]]; then
+        [[ "$EXTRAS" != ,* && "$EXTRAS" != *, && "$EXTRAS" != *,,* ]] || die "Invalid extras list"
+        IFS=',' read -r -a selected_extras <<< "$EXTRAS"
+        for extra in "${selected_extras[@]}"; do
+            [[ "$extra" =~ ^(wireless|editors|servers|references)$ ]] || die "Unknown extra: $extra"
+        done
+    fi
+    (( ! UPGRADE_SYSTEM )) || [[ "$MODE" == update ]] || die "--upgrade-system requires --update"
+    (( ! SETUP_BLOODHOUND )) || [[ "$MODE" == install || "$MODE" == update ]] || die "Setup cannot run in read-only modes"
 }
 
-install_virtualization_guest_tools() {
+select_options() {
+    local choice
+    if [[ -z "$PROFILE" ]]; then
+        [[ -t 0 ]] || die "Non-interactive runs require --profile"
+        read -r -p 'Profile: 1) Core  2) Extra (all tools) [2]: ' choice || die "Input closed"
+        case "${choice:-2}" in
+            1) PROFILE=core ;;
+            2) PROFILE=extra ;;
+            *) die "Invalid profile selection" ;;
+        esac
+    fi
+    if [[ -z "$VIRTUALIZATION_PLATFORM" ]]; then
+        if [[ "$MODE" == plan || "$MODE" == verify ]]; then
+            VIRTUALIZATION_PLATFORM=none
+        else
+            [[ -t 0 ]] || die "Non-interactive runs require --guest"
+            read -r -p 'Guest: 1) QEMU/KVM  2) VMware  3) VirtualBox  4) None: ' choice || die "Input closed"
+            case "$choice" in
+                1) VIRTUALIZATION_PLATFORM=qemu ;; 2) VIRTUALIZATION_PLATFORM=vmware ;;
+                3) VIRTUALIZATION_PLATFORM=virtualbox ;; 4) VIRTUALIZATION_PLATFORM=none ;;
+                *) die "Invalid guest selection" ;;
+            esac
+        fi
+    fi
+    if (( SETUP_BLOODHOUND || CHECK_BLOODHOUND )); then
+        [[ "$PROFILE" != core ]] || die "BloodHound requires the extra profile"
+    fi
+
+    if [[ "$PROFILE" == extra ]]; then
+        EXTRAS="wireless,editors,servers,references"
+        CONFIGURE_SHELL=1
+    fi
+}
+
+build_package_lists() {
+    REQUIRED_PACKAGES=(
+        ca-certificates curl wget git unzip build-essential python3 python3-venv pipx
+        nmap ncat smbclient enum4linux-ng exploitdb gobuster feroxbuster ffuf
+        burpsuite firefox-esr nikto openvpn iproute2 dnsutils net-tools
+        socat proxychains4 openssh-client john hydra hashcat wordlists seclists
+        tmux asciinema rlwrap jq neovim xclip flameshot tcpdump wireshark
+        ligolo-ng ligolo-ng-common-binaries chisel peass
+    )
+    OPTIONAL_PACKAGES=()
+    if [[ "$PROFILE" != core ]]; then
+        REQUIRED_PACKAGES+=(
+            netexec python3-impacket impacket-scripts certipy-ad evil-winrm
+            bloodhound bloodhound-ce-python python3-ldapdomaindump
+            krb5-user freerdp3-x11 metasploit-framework postgresql postgresql-client
+            mimikatz powersploit windows-binaries golang
+        )
+    fi
+    if [[ "$PROFILE" == extra ]]; then
+        REQUIRED_PACKAGES+=(coercer mitm6 responder)
+        OPTIONAL_PACKAGES+=(masscan eyewitness wpscan webshells cupp bettercap)
+    fi
     case "$VIRTUALIZATION_PLATFORM" in
-        qemu)
-            info "Installing QEMU/KVM guest tools"
-            apt_install_available qemu-guest-agent spice-vdagent
+        qemu) REQUIRED_PACKAGES+=(qemu-guest-agent spice-vdagent) ;;
+        vmware) REQUIRED_PACKAGES+=(open-vm-tools open-vm-tools-desktop) ;;
+        virtualbox) REQUIRED_PACKAGES+=(virtualbox-guest-x11) ;;
+    esac
+    if has_extra wireless; then OPTIONAL_PACKAGES+=(aircrack-ng realtek-rtl88xxau-dkms); fi
+    if has_extra editors; then OPTIONAL_PACKAGES+=(code-oss); fi
+    if has_extra servers; then OPTIONAL_PACKAGES+=(apache2 vsftpd docker.io docker-compose); fi
+    if has_extra references; then REQUIRED_PACKAGES+=(ruby); fi
+    if (( CONFIGURE_SHELL )); then REQUIRED_PACKAGES+=(zsh eza); fi
+}
 
-            if have_systemd; then
-                run_sudo systemctl enable --now qemu-guest-agent \
-                    || warn "Could not enable/start qemu-guest-agent."
-            fi
-            ;;
+show_plan() {
+    printf 'Action: %s\nProfile: %s\nGuest: %s\nExtras: %s\n' "$MODE" "$PROFILE" "$VIRTUALIZATION_PLATFORM" "${EXTRAS:-none}"
+    printf '\nRequired APT packages:\n'; printf '  %s\n' "${REQUIRED_PACKAGES[@]}"
+    if (( ${#OPTIONAL_PACKAGES[@]} )); then
+        printf '\nOptional APT packages (unavailable packages are reported):\n'
+        printf '  %s\n' "${OPTIONAL_PACKAGES[@]}"
+    fi
+    [[ "$PROFILE" == core ]] || printf '\nPinned Kerbrute: %s\n' "$KERBRUTE_REV"
+    [[ "$PROFILE" != extra ]] || printf 'Pinned DonPAPI: %s\n' "$DONPAPI_REV"
+    if (( CONFIGURE_SHELL )); then printf 'Pinned PentestManager/TPM; zsh and tmux configuration enabled.\n'; fi
+    if has_extra references; then printf 'Pinned PayloadsAllTheThings, SharpCollection and username-anarchy enabled.\n'; fi
+    return 0
+}
 
-        vmware)
-            info "Installing VMware guest tools"
-            apt_install_available open-vm-tools open-vm-tools-desktop
+require_kali_user() {
+    (( EUID != 0 )) || die "Run as your normal Kali user; the script invokes sudo when needed."
+    [[ -r /etc/os-release ]] || die "Cannot identify the operating system"
+    local ID=""
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    [[ "$ID" == kali ]] || die "This installer is for Kali guests only (detected: $ID)."
+}
 
-            if have_systemd; then
-                run_sudo systemctl enable --now open-vm-tools \
-                    || warn "Could not enable/start open-vm-tools."
-            fi
-            ;;
+apt_candidate() {
+    local output candidate
+    output="$(LC_ALL=C apt-cache policy "$1")" || return 2
+    candidate="$(awk '/^[[:space:]]*Candidate:/ { print $2; exit }' <<< "$output")"
+    [[ -n "$candidate" && "$candidate" != '(none)' ]]
+}
 
-        virtualbox)
-            info "Installing VirtualBox guest tools"
-            apt_install_available virtualbox-guest-x11
-            ;;
+select_available_packages() {
+    AVAILABLE_PACKAGES=()
+    SKIPPED_PACKAGES=()
+    local pkg status
+    local -a missing=()
+    for pkg in "${REQUIRED_PACKAGES[@]}"; do
+        if apt_candidate "$pkg"; then
+            AVAILABLE_PACKAGES+=("$pkg")
+        else
+            status=$?
+            (( status == 1 )) || die "APT query failed for $pkg"
+            missing+=("$pkg")
+        fi
+    done
+    (( ${#missing[@]} == 0 )) || die "Required packages unavailable: ${missing[*]}. Check your Kali repositories/suite; no packages were installed."
+    for pkg in "${OPTIONAL_PACKAGES[@]}"; do
+        if apt_candidate "$pkg"; then
+            AVAILABLE_PACKAGES+=("$pkg")
+        else
+            status=$?
+            (( status == 1 )) || die "APT query failed for optional package $pkg"
+            SKIPPED_PACKAGES+=("$pkg")
+            warn "Optional package unavailable: $pkg"
+        fi
+    done
+}
 
-        none)
-            info "Skipping virtualization guest tools"
-            ;;
+install_packages() {
+    # Install mode leaves already-installed selected packages alone. Dependencies
+    # may still change to satisfy APT. --no-remove prevents accidental removals.
+    local -a flags=(--no-remove)
+    [[ "$MODE" != install ]] || flags+=(--no-upgrade)
+    run_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${flags[@]}" "${AVAILABLE_PACKAGES[@]}"
+}
 
-        *)
-            warn "Unknown virtualization platform: $VIRTUALIZATION_PLATFORM"
-            return 1
-            ;;
+checkout_pinned() {
+    local url="$1" dest="$2" revision="$3" actual
+    [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || die "Source pin must be a full commit ID"
+    if [[ ! -e "$dest" ]]; then
+        mkdir -p "$dest"
+        git -C "$dest" init -q
+        git -C "$dest" remote add origin "$url"
+    fi
+    [[ -d "$dest/.git" ]] || die "Refusing to replace non-repository: $dest"
+    [[ "$(git -C "$dest" remote get-url origin)" == "$url" ]] || die "Unexpected origin in $dest"
+    [[ -z "$(git -C "$dest" status --porcelain)" ]] || die "Local changes in $dest; preserve them before installing"
+    if ! git -C "$dest" cat-file -e "$revision^{commit}" 2>/dev/null; then
+        git -C "$dest" fetch --depth 1 origin "$revision"
+    fi
+    git -C "$dest" checkout --detach "$revision"
+    actual="$(git -C "$dest" rev-parse HEAD)"
+    [[ "$actual" == "$revision" ]] || die "Source revision verification failed: $dest"
+    printf '%s\t%s\t%s\n' "$url" "$revision" "$dest" >> "$RUN_DIR/sources.tsv"
+}
+
+go_arch() {
+    case "$1" in
+        x86_64|amd64) printf 'amd64\n' ;;
+        aarch64|arm64) printf 'arm64\n' ;;
+        i386|i686) printf '386\n' ;;
+        *) die "Unsupported Kerbrute architecture: $1" ;;
     esac
 }
 
-# Display ASCII art
-banner="
-                        ██╗  ██╗ █████╗ ██╗     ██╗                             
-                        ██║ ██╔╝██╔══██╗██║     ██║                             
-                        █████╔╝ ███████║██║     ██║                             
-                        ██╔═██╗ ██╔══██║██║     ██║                             
-                        ██║  ██╗██║  ██║███████╗██║                             
-                        ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝                             
-                                                                                
-██╗    ██╗███████╗ █████╗ ██████╗  ██████╗ ███╗   ██╗██╗███████╗███████╗██████╗ 
-██║    ██║██╔════╝██╔══██╗██╔══██╗██╔═══██╗████╗  ██║██║╚══███╔╝██╔════╝██╔══██╗
-██║ █╗ ██║█████╗  ███████║██████╔╝██║   ██║██╔██╗ ██║██║  ███╔╝ █████╗  ██████╔╝
-██║███╗██║██╔══╝  ██╔══██║██╔═══╝ ██║   ██║██║╚██╗██║██║ ███╔╝  ██╔══╝  ██╔══██╗
-╚███╔███╔╝███████╗██║  ██║██║     ╚██████╔╝██║ ╚████║██║███████╗███████╗██║  ██║
- ╚══╝╚══╝ ╚══════╝╚═╝  ╚═╝╚═╝      ╚═════╝ ╚═╝  ╚═══╝╚═╝╚══════╝╚══════╝╚═╝  ╚═╝
-                                                                                
-                           -------------
-                             By P-ict0
-                           -------------
-"
+install_kerbrute() {
+    local dest="$HOME/tools/repos/kerbrute-pinned" arch
+    checkout_pinned https://github.com/ropnop/kerbrute.git "$dest" "$KERBRUTE_REV"
+    arch="$(go_arch "$(uname -m)")"
+    # Build directly for this guest; never pick an arbitrary file from dist/.
+    (cd "$dest" && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -mod=readonly -trimpath -o "$HOME/tools/bin/kerbrute" .)
+    sha256sum "$HOME/tools/bin/kerbrute" >> "$RUN_DIR/binaries.sha256"
+}
 
-echo -e "\n\n"
-echo -e "$banner"
-echo -e "\n\n"
-
-# Prompt sudo password
-info "Prompting for sudo password"
-sudo -v
-
-# Keep sudo alive while the script runs.
-while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done 2>/dev/null &
-SUDO_KEEPALIVE_PID=$!
-trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
-
-select_virtualization_platform
-info "Selected virtualization platform: $VIRTUALIZATION_PLATFORM"
-
-# DNS
-info "Setting up Google DNS"
-if [[ -w /etc/resolv.conf || -n "$(sudo -n true 2>/dev/null && echo yes || true)" ]]; then
-    if ! grep -q "nameserver 8.8.8.8" /etc/resolv.conf 2>/dev/null; then
-        echo "nameserver 8.8.8.8 # Google" | run_sudo tee -a /etc/resolv.conf > /dev/null || warn "Could not update /etc/resolv.conf"
+install_donpapi() {
+    local dest="$HOME/tools/repos/donpapi-pinned"
+    local marker="$PIPX_HOME/.weaponizer-donpapi-revision"
+    checkout_pinned https://github.com/login-securite/DonPAPI.git "$dest" "$DONPAPI_REV"
+    # An isolated environment; no system Python modifications.
+    # --force is confined to this application's environment, never --include-deps.
+    if [[ "$MODE" == install && -x "$PIPX_BIN_DIR/DonPAPI" && -f "$marker" ]] &&
+        [[ "$(cat "$marker")" == "$DONPAPI_REV" ]]; then
+        info "Keeping the installed DonPAPI environment; use --update to refresh it."
+    else
+        pipx install --force "$dest"
+        printf '%s\n' "$DONPAPI_REV" > "$marker"
     fi
-    if ! grep -q "nameserver 8.8.4.4" /etc/resolv.conf 2>/dev/null; then
-        echo "nameserver 8.8.4.4 # Google" | run_sudo tee -a /etc/resolv.conf > /dev/null || warn "Could not update /etc/resolv.conf"
+    pipx runpip donpapi freeze > "$RUN_DIR/donpapi-python-freeze.txt"
+}
+
+configure_shell() {
+    local pm="${XDG_CONFIG_HOME:-$HOME/.config}/PentestManager"
+    local tpm="$HOME/.tmux/plugins/tpm" file
+    checkout_pinned https://github.com/P-ict0/PentestManager.git "$pm" "$PENTESTMANAGER_REV"
+    checkout_pinned https://github.com/tmux-plugins/tpm "$tpm" "$TPM_REV"
+    for file in "$HOME/.zshrc" "$HOME/.tmux.conf"; do
+        if [[ -f "$file" ]]; then cp -p "$file" "$RUN_DIR/$(basename "$file").before"; fi
+    done
+    touch "$HOME/.zshrc"
+    if ! grep -qF '# Kali Weaponizer tools path' "$HOME/.zshrc"; then
+        cat >> "$HOME/.zshrc" <<'ZSH'
+
+# Kali Weaponizer tools path
+export PATH="$PATH:$HOME/tools/bin"
+export PIPX_HOME="$HOME/tools/pipx"
+export PIPX_BIN_DIR="$HOME/tools/bin"
+export PIPX_MAN_DIR="$HOME/tools/pipx/man"
+ZSH
     fi
-fi
-
-# Setup sources.list
-info "Setting up Kali apt source"
-ensure_kali_sources
-
-# Update packages
-info "Updating packages"
-apt_update
-
-# Remove packages to install them later
-PACKAGES_TO_REMOVE=(
-    crackmapexec
-    bloodhound
-    python3-ldapdomaindump
-    bloodhound.py
-    certipy-ad
-    responder
-    'openjdk*'
-    'oracle-java*'
-    java-common
-    netexec
-    postgresql
-)
-info "Removing conflicting packages with apt"
-apt_purge_installed_patterns "${PACKAGES_TO_REMOVE[@]}"
-
-# Update packages
-info "Upgrading packages"
-run_sudo env DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
-info "Autoremoving packages"
-run_sudo env DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
-info "Autocleaning packages"
-run_sudo apt-get autoclean -y
-
-# Install packages
-PACKAGES_TO_INSTALL=(
-    nmap
-    masscan
-    wfuzz
-    aircrack-ng
-    smbclient
-    ncat
-    wireshark
-    wireshark-common
-    asciinema
-    enum4linux
-    exploitdb
-    tcpdump
-    gobuster
-    feroxbuster
-    bettercap
-    autoconf
-    automake
-    autopoint
-    build-essential
-    ca-certificates
-    curl
-    git
-    gnupg
-    libtool
-    pkg-config
-    make
-    unzip
-    wget
-    xclip
-    ruby
-    realtek-rtl88xxau-dkms
-    ipcalc
-    eyewitness
-    vsftpd
-    powersploit
-    libkrb5-dev
-    code-oss
-    jq
-    evil-winrm
-    htop
-    default-jdk
-    openjdk-21-jdk
-    pipx
-    python3
-    python3-dev
-    python3-venv
-    python3-pip
-    golang
-    gdb
-    zenity
-    metasploit-framework
-    eza
-    postgresql
-    postgresql-client
-    hashcat
-    wordlists
-    rlwrap
-    dirbuster
-    wpscan
-    webshells
-    silversearcher-ag
-    cupp
-    freerdp3-x11
-    apache2
-    neovim
-    nikto
-)
-PACKAGES_TO_INSTALL_NONINTERACTIVE=(
-    krb5-user
-)
-
-info "Preseeding Wireshark capture setting"
-echo "wireshark-common wireshark-common/install-setuid boolean true" | run_sudo debconf-set-selections || true
-
-info "Installing needed packages"
-: > "$LOG_DIR/skipped-apt-packages.log"
-apt_install_available "${PACKAGES_TO_INSTALL[@]}"
-apt_install_available "${PACKAGES_TO_INSTALL_NONINTERACTIVE[@]}"
-
-# Wireshark configuration
-info "Enabling Wireshark non-root capture"
-if getent group wireshark >/dev/null 2>&1; then
-    run_sudo usermod -aG wireshark "$USER" || true
-else
-    warn "wireshark group not found; skipping usermod."
-fi
-
-install_virtualization_guest_tools
-
-# Set timezone
-info "Setting timezone to Amsterdam"
-if have_systemd && command -v timedatectl >/dev/null 2>&1; then
-    run_sudo timedatectl set-timezone Europe/Amsterdam
-else
-    warn "timedatectl/systemd is not available; timezone not changed."
-fi
-
-# Create folders
-info "Creating needed folders"
-run_sudo mkdir -p /usr/share/ca-certificates
-mkdir -p "$HOME/tools/bin" "$HOME/tools/repos" "$HOME/tools/pipx/man"
-
-# Add ~/tools/bin to PATH
-info "Adding ~/tools/bin to PATH"
-touch "$HOME/.zshrc"
-if ! grep -qF "export PATH=\$PATH:$HOME/tools/bin" "$HOME/.zshrc"; then
-    echo "export PATH=\$PATH:$HOME/tools/bin" >> "$HOME/.zshrc"
-fi
-
-# Add ~/tools/bin to secure_path in /etc/sudoers.d
-info "Adding ~/tools/bin to sudo secure_path"
-USER_HOME="$(getent passwd "$USER" | cut -d: -f6)"
-SUDOERS_D="/etc/sudoers.d/99-tools-bin"
-TMP_SUDOERS="$(mktemp)"
-
-echo "Defaults secure_path=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${USER_HOME}/tools/bin\"" > "$TMP_SUDOERS"
-if run_sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
-    run_sudo install -m 440 "$TMP_SUDOERS" "$SUDOERS_D"
-    echo "Successfully added ${USER_HOME}/tools/bin to secure_path in ${SUDOERS_D}"
-else
-    warn "Invalid sudoers fragment. Change not applied."
-fi
-rm -f "$TMP_SUDOERS"
-
-# ZSH config
-info "Setting up zsh and PentestManager"
-PM_REPO_URL="https://github.com/P-ict0/PentestManager.git"
-PM_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/PentestManager"
-ZSHRC="$HOME/.zshrc"
-
-mkdir -p "$(dirname "$PM_DIR")"
-clone_or_update "$PM_REPO_URL" "$PM_DIR"
-
-if [[ -f "$ZSHRC" && ! -f "$ZSHRC.bak_pentestmanager" ]]; then
-    info "Backing up ~/.zshrc to ~/.zshrc.bak_pentestmanager"
-    cp "$ZSHRC" "$ZSHRC.bak_pentestmanager"
-fi
-
-LOADER_MARKER="# PentestManager (autoload)"
-if ! grep -qF "$LOADER_MARKER" "$ZSHRC" 2>/dev/null; then
-    info "Adding PentestManager loader to ~/.zshrc"
-    cat <<'EOL' >> "$ZSHRC"
+    if ! grep -qF '# PentestManager (autoload)' "$HOME/.zshrc"; then
+        cat >> "$HOME/.zshrc" <<'ZSH'
 
 # PentestManager (autoload)
-[[ -o interactive ]] || return
-source "${XDG_CONFIG_HOME:-$HOME/.config}/PentestManager/src/init.zsh"
-EOL
-else
-    info "Loader already present in ~/.zshrc"
+if [[ -o interactive ]]; then
+    source "${XDG_CONFIG_HOME:-$HOME/.config}/PentestManager/src/init.zsh"
 fi
-
-info "Setting up pipx"
-add_line() { grep -qxF "$1" "$HOME/.zshrc" || echo "$1" >> "$HOME/.zshrc"; }
-add_line "export PIPX_HOME='$HOME/tools/pipx'"
-add_line "export PIPX_BIN_DIR='$HOME/tools/bin'"
-add_line "export PIPX_MAN_DIR='$HOME/tools/pipx/man'"
-
-# Ensure a locale exists
-info "Ensuring a locale exists"
-if [[ -f /etc/locale.gen ]] && ! grep -q "^en_US.UTF-8 UTF-8" /etc/locale.gen; then
-    echo "en_US.UTF-8 UTF-8" | run_sudo tee -a /etc/locale.gen > /dev/null
-    run_sudo locale-gen
-fi
-
-# Set locale
-info "Setting locale to en_US.UTF-8"
-run_sudo update-locale LANG=en_US.UTF-8 || warn "Could not update locale."
-
-# Start and enable PostgreSQL service
-info "Starting and enabling PostgreSQL"
-if have_systemd; then
-    run_sudo systemctl enable --now postgresql || warn "Could not enable/start PostgreSQL."
-else
-    warn "systemd is not available; PostgreSQL service was not started."
-fi
-if command -v psql >/dev/null 2>&1; then
-    run_sudo -u postgres psql -c "REINDEX DATABASE postgres;" || true
-    run_sudo -u postgres psql -c "ALTER DATABASE postgres REFRESH COLLATION VERSION;" || true
-fi
-
-# Initialize the MSF database
-info "Initializing msfdb"
-if command -v msfdb >/dev/null 2>&1; then
-    run_sudo msfdb init || warn "msfdb init failed or database already exists; continuing."
-else
-    warn "msfdb command not found; skipping."
-fi
-
-# Tools
-# BloodHound.py
-info "Installing BloodHound.py"
-pipx_install_force git+https://github.com/fox-it/BloodHound.py
-
-# Burp Suite
-info "Installing Burp Suite"
-apt_install_available burpsuite
-chmod +x "./templates/scripts/get-burp-certificate.sh"
-if [[ -f /usr/share/burpsuite/burpsuite.jar ]]; then
-    bash "./templates/scripts/get-burp-certificate.sh" || warn "Could not auto-fetch Burp CA certificate. Start Burp once and export the CA manually if needed."
-    if [[ -s /tmp/burpCA.der ]]; then
-        run_sudo mv /tmp/burpCA.der /usr/share/ca-certificates/burpCA.der
+ZSH
     fi
-else
-    warn "Burp Suite jar not found; skipping CA extraction."
+    cp "$SCRIPT_DIR/templates/configurations/tmux/tmux.conf" "$HOME/.tmux.conf"
+}
+
+install_references() {
+    checkout_pinned https://github.com/swisskyrepo/PayloadsAllTheThings "$HOME/tools/repos/PayloadsAllTheThings" "$PAYLOADS_REV"
+    checkout_pinned https://github.com/Flangvik/SharpCollection "$HOME/tools/repos/SharpCollection" "$SHARPCOLLECTION_REV"
+    checkout_pinned https://github.com/urbanadventurer/username-anarchy.git "$HOME/tools/repos/username-anarchy" "$USERNAME_ANARCHY_REV"
+    ln -sfn "$HOME/tools/repos/username-anarchy/username-anarchy" "$HOME/tools/bin/username-anarchy"
+}
+
+configure_guest() {
+    local service=""
+    case "$VIRTUALIZATION_PLATFORM" in
+        qemu) service=qemu-guest-agent ;;
+        vmware) service=open-vm-tools ;;
+    esac
+    if [[ -n "$service" ]] && have_systemd; then
+        # QEMU agents can be static/device-activated; starting is sufficient.
+        if ! run_sudo systemctl start "$service"; then
+            warn "Guest tools installed but $service did not start; check hypervisor channels/reboot."
+            printf '%s\n' "$service" >> "$RUN_DIR/service-warnings.txt"
+        fi
+    fi
+}
+
+verify_installation() {
+    local pkg cmd failed=0
+    local -a smoke=(nmap ffuf feroxbuster gobuster openvpn socat chisel ligolo-proxy)
+    for pkg in "${REQUIRED_PACKAGES[@]}"; do
+        if [[ "$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null || true)" != 'install ok installed' ]]; then
+            warn "Required package missing/unconfigured: $pkg"; failed=1
+        fi
+    done
+    if [[ "$PROFILE" != core ]]; then
+        smoke+=(nxc impacket-smbclient certipy-ad bloodhound-ce-python kerbrute)
+        for cmd in bloodhound-setup bloodhound-start bloodhound-stop evil-winrm; do
+            if ! command -v "$cmd" >/dev/null; then warn "Missing command: $cmd"; failed=1; fi
+        done
+    fi
+    if [[ "$PROFILE" == extra ]]; then smoke+=(coercer mitm6 responder DonPAPI); fi
+    for cmd in "${smoke[@]}"; do
+        if ! command -v "$cmd" >/dev/null; then
+            warn "Missing command: $cmd"; failed=1
+        elif ! timeout 30 "$cmd" -h > "$RUN_DIR/check-$cmd.log" 2>&1; then
+            warn "CLI smoke test failed: $cmd (see check-$cmd.log)"; failed=1
+        fi
+    done
+    if [[ ! -s /usr/share/peass/linpeas/linpeas.sh || ! -s /usr/share/peass/winpeas/winPEASany.exe ]]; then
+        warn "PEASS target files are missing"; failed=1
+    fi
+    if ! dpkg-query -L ligolo-ng-common-binaries > "$RUN_DIR/ligolo-agent-files.txt"; then
+        warn "Cannot list Ligolo agent files"; failed=1
+    elif ! grep -Eq 'windows.*amd64.*\.exe$' "$RUN_DIR/ligolo-agent-files.txt"; then
+        warn "Windows amd64 Ligolo agent not found"; failed=1
+    fi
+    if (( CONFIGURE_SHELL )); then
+        if ! zsh -n "$HOME/.zshrc"; then warn "Invalid zsh configuration"; failed=1; fi
+    fi
+    if (( CHECK_BLOODHOUND )); then
+        # A UI check is separate from CLI installation and data-import testing.
+        if ! curl --noproxy '*' -fsSL --max-time 15 http://127.0.0.1:8080/ui/login > "$RUN_DIR/bloodhound-ui.html"; then
+            warn "BloodHound UI is not reachable on localhost:8080"; failed=1
+        elif ! grep -qi bloodhound "$RUN_DIR/bloodhound-ui.html"; then
+            warn "Port 8080 responded but does not appear to serve BloodHound"; failed=1
+        fi
+    fi
+    (( failed == 0 ))
+}
+
+write_manifest() {
+    {
+        printf 'Timestamp: %s\nProfile: %s\nGuest: %s\nExtras: %s\n' "$(date -u +%FT%TZ)" "$PROFILE" "$VIRTUALIZATION_PLATFORM" "$EXTRAS"
+        printf 'Installer HEAD: '; git -C "$SCRIPT_DIR" rev-parse HEAD
+        printf 'Installer SHA256: '; sha256sum "$SCRIPT_DIR/weaponize.sh"
+        uname -srmo
+    } > "$RUN_DIR/environment.txt"
+    dpkg-query -W -f='${binary:Package}\t${Version}\t${Status}\n' > "$RUN_DIR/apt-packages.tsv"
+    pipx list --json > "$RUN_DIR/pipx.json"
+    if (( ${#SKIPPED_PACKAGES[@]} )); then printf '%s\n' "${SKIPPED_PACKAGES[@]}" > "$RUN_DIR/skipped-apt-packages.txt"; fi
+}
+
+main() {
+    parse_args "$@"
+    select_options
+    build_package_lists
+    show_plan
+    [[ "$MODE" != plan ]] || return 0
+    require_kali_user
+    export PATH="$PATH:$HOME/tools/bin"
+    export PIPX_HOME="$HOME/tools/pipx" PIPX_BIN_DIR="$HOME/tools/bin" PIPX_MAN_DIR="$HOME/tools/pipx/man"
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/kali-weaponizer"
+    mkdir -p "$state_dir"
+    RUN_DIR="$(mktemp -d "$state_dir/run-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
+    export RUN_DIR
+    exec > >(tee "$RUN_DIR/run.log") 2>&1
+    trap 'warn "Failed on line $LINENO. Logs: $RUN_DIR"' ERR
+    if [[ "$MODE" == verify ]]; then
+        verify_installation
+        info "Local verification passed. Logs: $RUN_DIR"
+        return 0
+    fi
+    sudo -v
+    info "Refreshing existing APT sources (DNS and repository configuration are preserved)"
+    run_sudo apt-get -o APT::Update::Error-Mode=any update
+    select_available_packages
+    if (( UPGRADE_SYSTEM )); then
+        run_sudo env DEBIAN_FRONTEND=noninteractive apt-get --no-remove full-upgrade -y
+    fi
+    install_packages
+    mkdir -p "$HOME/tools/bin" "$HOME/tools/repos" "$HOME/tools/pipx/man"
+    if [[ "$PROFILE" != core ]]; then install_kerbrute; fi
+    if [[ "$PROFILE" == extra ]]; then
+        install_donpapi
+        install -m 755 "$SCRIPT_DIR/templates/scripts/extract-hashes-responder.sh" "$HOME/tools/bin/extract-hashes-responder"
+    fi
+    if has_extra references; then install_references; fi
+    if (( CONFIGURE_SHELL )); then configure_shell; fi
+    configure_guest
+    if [[ -f /usr/share/wordlists/rockyou.txt.gz && ! -f /usr/share/wordlists/rockyou.txt ]]; then
+        run_sudo gzip -dk /usr/share/wordlists/rockyou.txt.gz
+    fi
+    if (( SETUP_BLOODHOUND )); then
+        run_sudo bloodhound-setup
+        run_sudo bloodhound-start
+        CHECK_BLOODHOUND=1
+    fi
+    write_manifest
+    verify_installation
+    if (( ${#SKIPPED_PACKAGES[@]} )) || [[ -s "$RUN_DIR/service-warnings.txt" ]]; then
+        warn "Required tool checks passed with optional/guest-service warnings. Review $RUN_DIR"
+    else
+        info "Required package and CLI checks passed. Manifest/logs: $RUN_DIR"
+    fi
+    if [[ "$PROFILE" != core ]] && (( ! CHECK_BLOODHOUND )); then
+        warn "BloodHound is installed; service readiness and data import are NOT verified. See README setup steps."
+    fi
+    info 'Before an exam: test VPN/DNS, BloodHound data import, screenshots and reporting; then snapshot the VM.'
+    info 'Tools bin: ~/tools/bin (add to your guest shell PATH or use explicit paths).'
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-run_sudo mkdir -p /usr/share/firefox-esr/distribution
-run_sudo cp "./templates/configurations/firefox/firefox_policies.json" /usr/share/firefox-esr/distribution/policies.json
-
-# Certipy
-info "Installing Certipy"
-pipx_install_force git+https://github.com/ly4k/Certipy
-
-# Coercer
-info "Installing Coercer"
-pipx_install_force git+https://github.com/p0dalirius/Coercer
-
-# Docker
-install_docker_from_kali
-
-# BloodHound CE
-info "Installing BloodHound CE"
-mkdir -p "$HOME/tools/repos/BloodHoundCE"
-curl -fsSL https://ghst.ly/getbhce -o "$HOME/tools/repos/BloodHoundCE/docker-compose.yml"
-
-# Impacket
-info "Installing Impacket"
-pipx_install_force git+https://github.com/fortra/impacket
-
-# Kerbrute
-info "Installing Kerbrute"
-KERBRUTE_DIR="$HOME/tools/repos/Kerbrute"
-clone_or_update https://github.com/ropnop/kerbrute "$KERBRUTE_DIR"
-make -C "$KERBRUTE_DIR" linux
-KERBRUTE_BIN="$(find "$KERBRUTE_DIR/dist" -type f \( -name 'kerbrute_linux_amd64' -o -name 'kerbrute_linux_x86_64' -o -name 'kerbrute_linux_386' \) | sort | head -n 1)"
-if [[ -n "$KERBRUTE_BIN" ]]; then
-    ln -sf "$KERBRUTE_BIN" "$HOME/tools/bin/kerbrute"
-    chmod +x "$KERBRUTE_BIN"
-else
-    warn "Kerbrute build finished but no Linux binary was found."
-fi
-
-# ldapdomaindump
-info "Installing ldapdomaindump"
-pipx_install_force git+https://github.com/dirkjanm/ldapdomaindump
-
-# Mitm6
-info "Installing Mitm6"
-pipx_install_force git+https://github.com/dirkjanm/mitm6
-
-# NetExec
-info "Installing NetExec"
-pipx_install_force git+https://github.com/Pennyw0rth/NetExec
-
-# Responder
-info "Installing Responder"
-RESPONDER_DIR="$HOME/tools/repos/Responder"
-RESPONDER_VENV="$RESPONDER_DIR/.venv"
-clone_or_update https://github.com/lgandx/Responder "$RESPONDER_DIR"
-
-python3 -m venv "$RESPONDER_VENV"
-# shellcheck disable=SC1091
-source "$RESPONDER_VENV/bin/activate"
-pip install --upgrade pip wheel
-pip install -r "$RESPONDER_DIR/requirements.txt"
-deactivate
-
-cp "./templates/scripts/extract-hashes-responder.sh" "$HOME/tools/bin/extract-hashes-responder"
-chmod +x "$HOME/tools/bin/extract-hashes-responder"
-
-mkdir -p "$RESPONDER_DIR/certs"
-openssl genrsa -out "$RESPONDER_DIR/certs/responder.key" 2048
-openssl req -new -x509 -days 3650 -key "$RESPONDER_DIR/certs/responder.key" -out "$RESPONDER_DIR/certs/responder.crt" -subj "/"
-
-mkdir -p "$RESPONDER_DIR/bin"
-cat <<EOL > "$RESPONDER_DIR/bin/run_responder.sh"
-#!/usr/bin/env bash
-source "$HOME/tools/repos/Responder/.venv/bin/activate"
-"$HOME/tools/repos/Responder/.venv/bin/python" "$HOME/tools/repos/Responder/Responder.py" "\${@:1}"
-EOL
-chmod +x "$RESPONDER_DIR/bin/run_responder.sh"
-ln -sf "$RESPONDER_DIR/bin/run_responder.sh" "$HOME/tools/bin/responder"
-
-# Sublime Text
-info "Installing Sublime Text"
-curl -fsSL https://download.sublimetext.com/sublimehq-pub.gpg -o /tmp/sublimehq-archive.gpg
-run_sudo mkdir -p /etc/apt/keyrings
-run_sudo gpg --dearmor --yes -o /etc/apt/keyrings/sublimehq-archive.gpg /tmp/sublimehq-archive.gpg
-rm -f /tmp/sublimehq-archive.gpg
-echo "deb [signed-by=/etc/apt/keyrings/sublimehq-archive.gpg] https://download.sublimetext.com/ apt/stable/" | run_sudo tee /etc/apt/sources.list.d/sublime-text.list > /dev/null
-apt_update
-apt_install_available sublime-text hunspell-en-us
-
-# DonPAPI
-info "Installing DonPAPI"
-pipx_install_force git+https://github.com/login-securite/DonPAPI.git
-
-# PayloadsAllTheThings
-info "Installing PayloadsAllTheThings"
-clone_or_update https://github.com/swisskyrepo/PayloadsAllTheThings /opt/payloadsallthethings
-
-# SecLists
-info "Installing SecLists"
-clone_or_update https://github.com/danielmiessler/SecLists /opt/seclists
-
-# SharpCollection
-info "Installing SharpCollection"
-clone_or_update https://github.com/Flangvik/SharpCollection /opt/sharpcollection
-
-# PEASS-NG
-info "Fetching PEASS-NG"
-run_sudo mkdir -p /opt/PEASS-ng
-run_sudo chown -R "$USER:$USER" /opt/PEASS-ng
-curl -fL https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh -o /opt/PEASS-ng/linpeas.sh
-curl -fL https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEASany.exe -o /opt/PEASS-ng/winPEASany.exe
-chmod +x /opt/PEASS-ng/linpeas.sh
-
-# Mimikatz
-info "Fetching Mimikatz"
-run_sudo mkdir -p /opt/mimikatz
-run_sudo chown -R "$USER:$USER" /opt/mimikatz
-curl -fL https://github.com/gentilkiwi/mimikatz/releases/latest/download/mimikatz_trunk.zip -o /opt/mimikatz/mimikatz.zip
-unzip -oq /opt/mimikatz/mimikatz.zip -d /opt/mimikatz
-
-# Extracting rockyou.txt
-info "Extracting rockyou.txt"
-if [[ -f /usr/share/wordlists/rockyou.txt.gz && ! -f /usr/share/wordlists/rockyou.txt ]]; then
-    run_sudo gzip -dk /usr/share/wordlists/rockyou.txt.gz
-fi
-
-# Install username-anarchy
-info "Installing username-anarchy"
-USERNAME_ANARCHY_DIR="$HOME/tools/repos/username-anarchy"
-clone_or_update https://github.com/urbanadventurer/username-anarchy.git "$USERNAME_ANARCHY_DIR"
-ln -sf "$USERNAME_ANARCHY_DIR/username-anarchy" "$HOME/tools/bin/username-anarchy"
-
-# Tmux
-info "Installing Tmux"
-apt_update
-apt_install_available tmux
-if [[ ! -d "$HOME/.tmux/plugins/tpm/.git" ]]; then
-    git clone https://github.com/tmux-plugins/tpm "$HOME/.tmux/plugins/tpm"
-else
-    git -C "$HOME/.tmux/plugins/tpm" pull --ff-only
-fi
-cp "./templates/configurations/tmux/tmux.conf" "$HOME/.tmux.conf"
-
-# Pipx setup path
-info "Setting up pipx path"
-PIPX_HOME="$HOME/tools/pipx" \
-PIPX_BIN_DIR="$HOME/tools/bin" \
-PIPX_MAN_DIR="$HOME/tools/pipx/man" \
-    pipx ensurepath || true
-
-# Define the output file
-output_file="$HOME/tools_to_download.txt"
-
-cat > "$output_file" <<'EOL'
-Other tools you can install manually:
-  Recommended:
-  - Hoaxshell: https://github.com/t3l3machus/hoaxshell
-  - Krbrelayx: https://github.com/dirkjanm/krbrelayx
-  - Ntdsxtract: https://github.com/csababarta/ntdsxtract
-  - PKINITtools https://github.com/dirkjanm/PKINITtools
-  - Pretender: https://github.com/RedTeamPentesting/pretender
-  - ROADtools: https://github.com/dirkjanm/ROADtools
-  - ROADtools_hybrid https://github.com/dirkjanm/roadtools_hybrid
-  - Adconnectdump: https://github.com/dirkjanm/adconnectdump
-  - LaZagne: https://github.com/AlessandroZ/LaZagne
-  - MFASweep: https://github.com/dafthack/MFASweep
-EOL
-
-echo -e "\n\n\n\n"
-cat "$output_file"
-
-echo -e "\n\n"
-echo "Tool recommendations have been saved to $output_file"
-
-if [[ -s "$LOG_DIR/skipped-apt-packages.log" ]]; then
-    warn "Some APT packages were unavailable and skipped. See: $LOG_DIR/skipped-apt-packages.log"
-fi
-
-info "Shell setup"
-echo "Open a new terminal or run 'exec zsh' to load updated PATH and pipx settings."
-echo "If Docker/Wireshark group membership changed, log out and back in before using those features."
-
-echo "Setup done."
-echo "Happy Hacking :)"
