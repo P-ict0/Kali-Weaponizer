@@ -183,6 +183,81 @@ install_docker_from_kali() {
     fi
 }
 
+select_virtualization_platform() {
+    local choice
+
+    echo
+    echo "Select virtualization platform for guest integration:"
+    echo "  1) QEMU/KVM"
+    echo "  2) VMware"
+    echo "  3) VirtualBox"
+    echo "  4) None (skip virtualization guest tools)"
+
+    while true; do
+        read -r -p "Choice [1-4]: " choice
+
+        case "$choice" in
+            1)
+                VIRTUALIZATION_PLATFORM="qemu"
+                return 0
+                ;;
+            2)
+                VIRTUALIZATION_PLATFORM="vmware"
+                return 0
+                ;;
+            3)
+                VIRTUALIZATION_PLATFORM="virtualbox"
+                return 0
+                ;;
+            4)
+                VIRTUALIZATION_PLATFORM="none"
+                return 0
+                ;;
+            *)
+                warn "Invalid selection. Choose 1, 2, 3, or 4."
+                ;;
+        esac
+    done
+}
+
+install_virtualization_guest_tools() {
+    case "$VIRTUALIZATION_PLATFORM" in
+        qemu)
+            info "Installing QEMU/KVM guest tools"
+            apt_install_available qemu-guest-agent spice-vdagent
+
+            if have_systemd; then
+                run_sudo systemctl enable --now qemu-guest-agent \
+                    || warn "Could not enable/start qemu-guest-agent."
+            fi
+            ;;
+
+        vmware)
+            info "Installing VMware guest tools"
+            apt_install_available open-vm-tools open-vm-tools-desktop
+
+            if have_systemd; then
+                run_sudo systemctl enable --now open-vm-tools \
+                    || warn "Could not enable/start open-vm-tools."
+            fi
+            ;;
+
+        virtualbox)
+            info "Installing VirtualBox guest tools"
+            apt_install_available virtualbox-guest-x11
+            ;;
+
+        none)
+            info "Skipping virtualization guest tools"
+            ;;
+
+        *)
+            warn "Unknown virtualization platform: $VIRTUALIZATION_PLATFORM"
+            return 1
+            ;;
+    esac
+}
+
 # Display ASCII art
 banner="
                         ██╗  ██╗ █████╗ ██╗     ██╗                             
@@ -216,6 +291,9 @@ sudo -v
 while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done 2>/dev/null &
 SUDO_KEEPALIVE_PID=$!
 trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
+
+select_virtualization_platform
+info "Selected virtualization platform: $VIRTUALIZATION_PLATFORM"
 
 # DNS
 info "Setting up Google DNS"
@@ -350,10 +428,7 @@ else
     warn "wireshark group not found; skipping usermod."
 fi
 
-# Install virtualbox-guest-x11
-info "Installing virtualbox-guest-x11"
-apt_install_available virtualbox-guest-x11
-run_sudo apt-get install -y --reinstall virtualbox-guest-x11 || warn "virtualbox-guest-x11 reinstall skipped/failed."
+install_virtualization_guest_tools
 
 # Set timezone
 info "Setting timezone to Amsterdam"
