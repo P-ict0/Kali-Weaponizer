@@ -62,7 +62,9 @@ parse_args() {
     while (( $# )); do
         case "$1" in
             --profile|--guest|--extras)
-                (( $# >= 2 )) && [[ "$2" != --* ]] || die "Missing value for $1"
+                if (( $# < 2 )) || [[ "$2" == --* ]]; then
+                    die "Missing value for $1"
+                fi
                 case "$1" in
                     --profile) PROFILE="$2" ;;
                     --guest) VIRTUALIZATION_PLATFORM="$2" ;;
