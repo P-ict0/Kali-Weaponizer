@@ -27,6 +27,14 @@ bash weaponize.sh --plan --profile extra --guest qemu
 
 `--plan` makes no changes and downloads nothing.
 
+The interactive display uses green section dividers, cyan prompts, yellow warnings
+and red errors. A bottom status line shows the current task, spinner and elapsed
+time while command output continues above it. There are no artificial delays or
+estimated percentages. Use `--no-progress` to disable the footer, or `NO_COLOR=1`
+to disable colours. Redirected output and run logs stay plain text. The footer is
+restored on success, failure and Ctrl-C; small or unsupported terminals use normal
+step messages instead.
+
 ## Choose a profile
 
 | Profile | What you get |
@@ -109,7 +117,9 @@ With `extra` or `--configure-shell`, open a new zsh terminal to pick up `~/tools
 
 ## Troubleshooting
 
-- **Missing required APT package:** Check your Kali repositories and run `sudo apt update`. The script stops rather than silently omitting a required tool; unavailable *optional* packages are skipped with a warning.
+- **Missing required APT package:** Check your Kali repositories and run `sudo apt update`. DNS tools use the real `bind9-dnsutils` package (`dig`, `nslookup`, `nsupdate`), not the virtual `dnsutils` name. The RDP client uses `freerdp-x11` (`xfreerdp`). The script stops rather than silently omitting a required tool; unavailable *optional* packages are skipped with a warning.
+- **APT dependency conflict:** Before installation, the script simulates the selected APT transaction with package removals blocked. See `apt-preflight.log` in the run directory for held packages, conflicts or missing dependencies. Repository changes between preflight and installation can still cause failures.
+- **VirtualBox on ARM64:** Kali currently does not provide `virtualbox-guest-x11` for ARM64. Use an applicable guest integration option or `--guest none`; the installer reports this before installing packages.
 - **VM clipboard/display not working:** Ensure you selected the correct guest platform, then check your hypervisor's guest-agent/SPICE settings and reboot Kali if needed.
 - **A command or installation check fails:** See the latest `run.log` and `check-*.log` under `~/.local/state/kali-weaponizer/run-*/`.
 - **Existing/customized VM:** This installer assumes a fresh Kali installation. Resolve old installations and command-path conflicts separately; it does not migrate or uninstall them.
@@ -190,12 +200,16 @@ These checks do not install tools or modify the host:
 
 ```bash
 bash -n weaponize.sh
-bash -n templates/scripts/get-burp-certificate.sh
-shellcheck weaponize.sh templates/scripts/get-burp-certificate.sh
+for script in templates/scripts/*.sh; do bash -n "$script"; done
+shellcheck weaponize.sh templates/scripts/*.sh
 python3 -m unittest discover -s tests -v
 bash weaponize.sh --plan --profile extra --guest qemu
 ```
 
-GitHub Actions runs syntax, ShellCheck and offline regression tests. Full package
+GitHub Actions runs syntax, ShellCheck, offline workflow/terminal regressions, and
+APT dependency simulations for both profiles and all four guest options in a fresh
+amd64 Kali rolling container. The container check refreshes indexes but does not
+install the selected tools. This catches renamed or unavailable packages and
+dependency conflicts before release. Full package
 installation, VM integrations, VPN connectivity and BloodHound import still need
 testing in a disposable Kali VM before relying on a new release.

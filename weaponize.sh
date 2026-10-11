@@ -19,6 +19,15 @@ UPGRADE_SYSTEM=0
 REQUIRED_PACKAGES=()
 OPTIONAL_PACKAGES=()
 SKIPPED_PACKAGES=()
+NO_PROGRESS=0
+UI_TTY=0
+UI_COLOR=0
+UI_FOOTER=0
+SPINNER_PID=""
+CURRENT_TASK="startup"
+TASK_NUMBER=0
+TASK_STARTED=0
+GREEN="" CYAN="" YELLOW="" RED="" RESET=""
 # Fixed source revisions captured on 2026-10-08; update deliberately.
 KERBRUTE_REV=9cfb81e4fab8037acb44c678773ca3f93bc2b39c
 PENTESTMANAGER_REV=1b32d010e8112717a533c0f2126e36539d3c7a7b
@@ -28,9 +37,112 @@ PAYLOADS_REV=3ac27901c711bdf3f5b65a7b1d1820a1f65bd09a
 SHARPCOLLECTION_REV=c53d7eb583d853de0bd693c1bb61581d59b2f44e
 USERNAME_ANARCHY_REV=e0631915ee90afb7ffcabf7900043927ef2f8934
 
-info() { printf '[+] %s\n' "$*"; }
-warn() { printf '[!] %s\n' "$*" >&2; }
-die() { warn "$*"; exit 1; }
+# -----------------------------------------------------------------------------
+# Terminal UI: colours for humans, ordinary text in redirected output/run.log.
+# The spinner never runs installation commands in a background subshell.
+# -----------------------------------------------------------------------------
+init_ui() {
+    if [[ -t 1 && "${TERM:-dumb}" != dumb ]]; then
+        UI_TTY=1
+        exec {UI_FD}>&1
+        if [[ -z "${NO_COLOR:-}" ]]; then
+            UI_COLOR=1
+            GREEN=$'\e[1;32m' CYAN=$'\e[1;36m' YELLOW=$'\e[1;33m'
+            RED=$'\e[1;31m' RESET=$'\e[0m'
+        fi
+    fi
+}
+
+info() { printf '%s[+]%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+die() { printf '%s[!]%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+
+section() {
+    local line width=78
+    if (( UI_TTY )); then width="$(tput cols 2>/dev/null || printf 78)"; fi
+    [[ "$width" =~ ^[0-9]+$ ]] || width=78
+    (( width > 120 )) && width=120
+    (( width > 1 )) || width=2
+    printf -v line '%*s' "$((width - 1))" ''
+    printf '\n%s%s%s\n' "$GREEN" "${line// /#}" "$RESET"
+    printf '%s[+] %s%s\n' "$GREEN" "$*" "$RESET"
+    printf '%s%s%s\n' "$GREEN" "${line// /#}" "$RESET"
+}
+
+stop_progress() {
+    if [[ -n "$SPINNER_PID" ]]; then
+        kill "$SPINNER_PID" 2>/dev/null || true
+        wait "$SPINNER_PID" 2>/dev/null || true
+        SPINNER_PID=""
+    fi
+    if (( UI_FOOTER )); then
+        # Reset scrolling margins even after failure, Ctrl-C or terminal resize.
+        printf '\0337\033[r\033[999;1H\033[2K\0338' >&"$UI_FD"
+        UI_FOOTER=0
+    fi
+}
+
+start_progress() {
+    (( UI_TTY && ! NO_PROGRESS )) || return 0
+    # Only terminals with a known VT-compatible scrolling region get a footer.
+    case "${TERM:-dumb}" in xterm*|screen*|tmux*|rxvt*|linux|vt100|vt220|ansi) ;; *) return 0 ;; esac
+    local rows cols
+    rows="$(env -u LINES -u COLUMNS tput lines 2>/dev/null || printf 24)"
+    cols="$(env -u LINES -u COLUMNS tput cols 2>/dev/null || printf 80)"
+    [[ "$rows" =~ ^[0-9]+$ && "$cols" =~ ^[0-9]+$ ]] || return 0
+    (( rows >= 4 && cols >= 20 )) || return 0
+    UI_FOOTER=1
+    # Keep the output cursor inside the scroll region, including when the prior
+    # command left it on the terminal's last row. Do this before starting work.
+    printf '\n\033[1;%sr\033[%s;1H' "$((rows - 1))" "$((rows - 1))" >&"$UI_FD"
+    (
+        trap - ERR EXIT
+        trap 'exit 0' INT TERM
+        local old_rows=$rows frame=0 text elapsed
+        local -a frames=('|' '/' '-' $'\\')
+        while :; do
+            rows="$(env -u LINES -u COLUMNS tput lines 2>/dev/null || printf 24)"
+            cols="$(env -u LINES -u COLUMNS tput cols 2>/dev/null || printf 80)"
+            [[ "$rows" =~ ^[0-9]+$ && "$cols" =~ ^[0-9]+$ ]] || break
+            (( rows >= 4 && cols >= 20 )) || break
+            if (( rows != old_rows )); then
+                printf '\033[r\n\033[1;%sr\033[%s;1H' "$((rows - 1))" "$((rows - 1))" >&"$UI_FD"
+                old_rows=$rows
+            fi
+            elapsed=$((SECONDS - TASK_STARTED))
+            printf -v text ' [%s] Step %s | %s | %02d:%02d elapsed' \
+                "${frames[frame % 4]}" "$TASK_NUMBER" "$CURRENT_TASK" "$((elapsed / 60))" "$((elapsed % 60))"
+            printf '\0337\033[%s;1H\033[2K%s%.*s%s\0338' \
+                "$rows" "$CYAN" "$((cols - 1))" "$text" "$RESET" >&"$UI_FD"
+            frame=$((frame + 1))
+            sleep 0.2
+        done
+    ) &
+    SPINNER_PID=$!
+}
+
+run_task() {
+    CURRENT_TASK="$1"
+    shift
+    TASK_NUMBER=$((TASK_NUMBER + 1))
+    TASK_STARTED=$SECONDS
+    section "Step $TASK_NUMBER: $CURRENT_TASK"
+    start_progress
+    # Do not wrap this call in `if`/`||`: that disables errexit in shell functions.
+    "$@"
+    stop_progress
+    info "Completed: $CURRENT_TASK ($((SECONDS - TASK_STARTED))s)"
+}
+
+cleanup_ui() {
+    local status=$?
+    stop_progress
+    if (( status != 0 )); then
+        warn "Stopped during: $CURRENT_TASK (exit $status). Logs: ${RUN_DIR:-not started}"
+    fi
+    return "$status"
+}
+
 run_sudo() { sudo "$@"; }
 have_systemd() { command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; }
 has_extra() { [[ ",$EXTRAS," == *",$1,"* ]]; }
@@ -51,6 +163,7 @@ Usage: bash weaponize.sh [options]
   --verify-bloodhound       Verify mode plus local BloodHound HTTP readiness.
   --setup-bloodhound        Run interactive Kali BloodHound setup/start after install.
   --plan                   Print package selections without writes/sudo/network.
+  --no-progress            Disable the live bottom task indicator.
   -h, --help               Show this help.
 
 Run as your normal user inside Kali, not as root or on the Arch/Windows host.
@@ -85,6 +198,7 @@ parse_args() {
             --upgrade-system) UPGRADE_SYSTEM=1; shift ;;
             --setup-bloodhound) SETUP_BLOODHOUND=1; shift ;;
             --configure-shell) CONFIGURE_SHELL=1; shift ;;
+            --no-progress) NO_PROGRESS=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "Unknown option: $1" ;;
         esac
@@ -111,7 +225,8 @@ select_options() {
     local choice
     if [[ -z "$PROFILE" ]]; then
         [[ -t 0 ]] || die "Non-interactive runs require --profile"
-        read -r -p 'Profile: 1) Core  2) Extra (all tools) [2]: ' choice || die "Input closed"
+        section 'Choose your tool profile'
+        read -r -p "${CYAN}[?] Profile: 1) Core  2) Extra (all tools) [2]: ${RESET}" choice || die "Input closed"
         case "${choice:-2}" in
             1) PROFILE=core ;;
             2) PROFILE=extra ;;
@@ -123,7 +238,8 @@ select_options() {
             VIRTUALIZATION_PLATFORM=none
         else
             [[ -t 0 ]] || die "Non-interactive runs require --guest"
-            read -r -p 'Guest: 1) QEMU/KVM  2) VMware  3) VirtualBox  4) None: ' choice || die "Input closed"
+            section 'Choose your VM platform'
+            read -r -p "${CYAN}[?] Guest: 1) QEMU/KVM  2) VMware  3) VirtualBox  4) None: ${RESET}" choice || die "Input closed"
             case "$choice" in
                 1) VIRTUALIZATION_PLATFORM=qemu ;; 2) VIRTUALIZATION_PLATFORM=vmware ;;
                 3) VIRTUALIZATION_PLATFORM=virtualbox ;; 4) VIRTUALIZATION_PLATFORM=none ;;
@@ -141,11 +257,14 @@ select_options() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# Package selection and preflight. Use real packages, not virtual/removed names.
+# -----------------------------------------------------------------------------
 build_package_lists() {
     REQUIRED_PACKAGES=(
         ca-certificates curl wget git unzip build-essential python3 python3-venv openssl
         nmap ncat smbclient enum4linux-ng exploitdb gobuster feroxbuster ffuf
-        burpsuite firefox-esr nikto openvpn iproute2 dnsutils net-tools
+        burpsuite firefox-esr nikto openvpn iproute2 bind9-dnsutils net-tools
         socat proxychains4 openssh-client john hydra hashcat wordlists seclists
         tmux asciinema rlwrap jq neovim xclip flameshot tcpdump wireshark
         ligolo-ng ligolo-ng-common-binaries chisel peass
@@ -155,7 +274,7 @@ build_package_lists() {
         REQUIRED_PACKAGES+=(
             netexec python3-impacket impacket-scripts certipy-ad evil-winrm
             bloodhound bloodhound-ce-python python3-ldapdomaindump
-            krb5-user freerdp3-x11 metasploit-framework postgresql postgresql-client
+            krb5-user freerdp-x11 metasploit-framework postgresql postgresql-client
             mimikatz powersploit windows-binaries golang
         )
     fi
@@ -176,6 +295,7 @@ build_package_lists() {
 }
 
 show_plan() {
+    section 'KALI WEAPONIZER | installation plan'
     printf 'Action: %s\nProfile: %s\nGuest: %s\nExtras: %s\n' "$MODE" "$PROFILE" "$VIRTUALIZATION_PLATFORM" "${EXTRAS:-none}"
     printf '\nRequired APT packages:\n'; printf '  %s\n' "${REQUIRED_PACKAGES[@]}"
     if (( ${#OPTIONAL_PACKAGES[@]} )); then
@@ -236,14 +356,36 @@ select_available_packages() {
     done
 }
 
-install_packages() {
+apt_install_flags() {
     # Install mode leaves already-installed selected packages alone. Dependencies
     # may still change to satisfy APT. --no-remove prevents accidental removals.
-    local -a flags=(--no-remove)
-    [[ "$MODE" != install ]] || flags+=(--no-upgrade)
-    run_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${flags[@]}" "${AVAILABLE_PACKAGES[@]}"
+    APT_INSTALL_FLAGS=(--no-remove -o Dpkg::Use-Pty=0)
+    [[ "$MODE" != install ]] || APT_INSTALL_FLAGS+=(--no-upgrade)
 }
 
+preflight_packages() {
+    if [[ "$VIRTUALIZATION_PLATFORM" == virtualbox && "$(dpkg --print-architecture)" != amd64 ]]; then
+        die "VirtualBox guest packages require amd64 in Kali. Select --guest none or your supported hypervisor."
+    fi
+    select_available_packages
+    apt_install_flags
+    # Candidate existence alone does not catch held/broken/conflicting dependencies.
+    if ! run_sudo env DEBIAN_FRONTEND=noninteractive apt-get --simulate install \
+        "${APT_INSTALL_FLAGS[@]}" "${AVAILABLE_PACKAGES[@]}" > "$RUN_DIR/apt-preflight.log" 2>&1; then
+        cat "$RUN_DIR/apt-preflight.log" >&2
+        die "APT dependency preflight failed; no packages were installed. See apt-preflight.log."
+    fi
+    info "APT resolved ${#AVAILABLE_PACKAGES[@]} selected packages."
+}
+
+install_packages() {
+    apt_install_flags
+    run_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${APT_INSTALL_FLAGS[@]}" "${AVAILABLE_PACKAGES[@]}"
+}
+
+# -----------------------------------------------------------------------------
+# Pinned source tools and isolated Python environments.
+# -----------------------------------------------------------------------------
 checkout_pinned() {
     local url="$1" dest="$2" revision="$3" actual
     [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || die "Source pin must be a full commit ID"
@@ -349,6 +491,9 @@ install_donpapi() {
     "$UV_BIN" pip freeze --python "$UV_TOOL_DIR/donpapi/bin/python" > "$RUN_DIR/donpapi-python-freeze.txt"
 }
 
+# -----------------------------------------------------------------------------
+# Optional configuration and guest integration.
+# -----------------------------------------------------------------------------
 preserve_config() {
     local source="$1" dest="$2"
     if [[ -e "$dest" || -L "$dest" ]]; then
@@ -430,6 +575,20 @@ configure_guest() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# Local smoke checks and run manifests (no scans or target connections).
+# -----------------------------------------------------------------------------
+smoke_command() {
+    local cmd="$1" flag=-h
+    case "$cmd" in
+        dig) flag=-v ;;
+        openvpn) flag=--version ;;
+        socat) flag=-V ;;
+        chisel) flag=--version ;;
+    esac
+    timeout --kill-after=5 30 "$cmd" "$flag"
+}
+
 verify_installation() {
     local pkg cmd failed=0 resolved
     if command -v uv >/dev/null && uv_usable "$(command -v uv)"; then
@@ -440,7 +599,7 @@ verify_installation() {
     else
         warn "uv >= $UV_VERSION is missing; install/update can provision it."; failed=1
     fi
-    local -a smoke=(nmap ffuf feroxbuster gobuster openvpn socat chisel ligolo-proxy)
+    local -a smoke=(dig nmap ffuf feroxbuster gobuster openvpn socat chisel ligolo-proxy)
     for pkg in "${REQUIRED_PACKAGES[@]}"; do
         if [[ "$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null || true)" != 'install ok installed' ]]; then
             warn "Required package missing/unconfigured: $pkg"; failed=1
@@ -463,7 +622,7 @@ verify_installation() {
                 warn "$cmd is shadowed by $resolved (Kali provides /usr/bin/$cmd)."
                 failed=1
             fi
-            if ! timeout 30 "$cmd" -h > "$RUN_DIR/check-$cmd.log" 2>&1; then
+            if ! smoke_command "$cmd" > "$RUN_DIR/check-$cmd.log" 2>&1; then
                 warn "CLI smoke test failed: $cmd (see check-$cmd.log)"; failed=1
             fi
         fi
@@ -505,8 +664,12 @@ write_manifest() {
     if (( ${#SKIPPED_PACKAGES[@]} )); then printf '%s\n' "${SKIPPED_PACKAGES[@]}" > "$RUN_DIR/skipped-apt-packages.txt"; fi
 }
 
+# -----------------------------------------------------------------------------
+# Main workflow. Each task stays in this shell so errors stop the run immediately.
+# -----------------------------------------------------------------------------
 main() {
     parse_args "$@"
+    init_ui
     select_options
     build_package_lists
     show_plan
@@ -518,43 +681,49 @@ main() {
     mkdir -p "$state_dir"
     RUN_DIR="$(mktemp -d "$state_dir/run-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
     export RUN_DIR
-    exec > >(tee "$RUN_DIR/run.log") 2>&1
+    if (( UI_COLOR )); then
+        exec > >(tee >(sed -u $'s/\033\\[[0-9;]*m//g' > "$RUN_DIR/run.log")) 2>&1
+    else
+        exec > >(tee "$RUN_DIR/run.log") 2>&1
+    fi
+    trap cleanup_ui EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     trap 'warn "Failed on line $LINENO. Logs: $RUN_DIR"' ERR
     if [[ "$MODE" == verify ]]; then
-        verify_installation
+        run_task 'Verify installed tools' verify_installation
         info "Local verification passed. Logs: $RUN_DIR"
         return 0
     fi
     command -v python3 >/dev/null || die "python3 is required for repository preflight (provided by standard Kali)."
     sudo -v
-    info "Refreshing existing APT sources (DNS and repository configuration are preserved)"
-    run_sudo apt-get -o APT::Update::Error-Mode=any update
-    select_available_packages
+    run_task 'Refresh existing APT sources' run_sudo apt-get -o APT::Update::Error-Mode=any update
+    run_task 'Check packages and resolve dependencies' preflight_packages
     if (( UPGRADE_SYSTEM )); then
-        run_sudo env DEBIAN_FRONTEND=noninteractive apt-get --no-remove full-upgrade -y
+        run_task 'Upgrade Kali packages' run_sudo env DEBIAN_FRONTEND=noninteractive apt-get --no-remove -o Dpkg::Use-Pty=0 full-upgrade -y
     fi
-    install_packages
+    run_task 'Install selected APT packages' install_packages
     mkdir -p "$HOME/tools/bin" "$HOME/tools/repos" "$UV_TOOL_DIR"
-    ensure_uv
-    if [[ "$PROFILE" != core ]]; then install_kerbrute; fi
+    run_task 'Provision uv' ensure_uv
+    if [[ "$PROFILE" != core ]]; then run_task 'Build pinned Kerbrute' install_kerbrute; fi
     if [[ "$PROFILE" == extra ]]; then
-        install_donpapi
+        run_task 'Install isolated DonPAPI environment' install_donpapi
         install -m 755 "$SCRIPT_DIR/templates/scripts/extract-hashes-responder.sh" "$HOME/tools/bin/extract-hashes-responder"
     fi
-    if has_extra references; then install_references; fi
-    if (( CONFIGURE_SHELL )); then configure_shell; fi
-    configure_guest
-    if (( CONFIGURE_BURP )); then configure_burp; fi
+    if has_extra references; then run_task 'Fetch pinned reference repositories' install_references; fi
+    if (( CONFIGURE_SHELL )); then run_task 'Configure zsh and tmux' configure_shell; fi
+    run_task 'Configure guest integration' configure_guest
+    if (( CONFIGURE_BURP )); then run_task 'Configure Burp and Firefox' configure_burp; fi
     if [[ -f /usr/share/wordlists/rockyou.txt.gz && ! -f /usr/share/wordlists/rockyou.txt ]]; then
-        run_sudo gzip -dk /usr/share/wordlists/rockyou.txt.gz
+        run_task 'Extract rockyou wordlist' run_sudo gzip -dk /usr/share/wordlists/rockyou.txt.gz
     fi
     if (( SETUP_BLOODHOUND )); then
-        run_sudo bloodhound-setup
-        run_sudo bloodhound-start
+        run_task 'Set up BloodHound (follow prompts above)' run_sudo bloodhound-setup
+        run_task 'Start BloodHound' run_sudo bloodhound-start
         CHECK_BLOODHOUND=1
     fi
-    write_manifest
-    verify_installation
+    run_task 'Write package and source manifests' write_manifest
+    run_task 'Verify installed tools' verify_installation
     if (( ${#SKIPPED_PACKAGES[@]} )) || [[ -s "$RUN_DIR/service-warnings.txt" ]]; then
         warn "Required tool checks passed with optional/guest-service warnings. Review $RUN_DIR"
     else

@@ -22,6 +22,6 @@ else
   RESULTS=$2
 fi
 
-for user in $(/usr/bin/grep -ioE "complete[^:]+:[^:]+:" "$1" | /usr/bin/sort -u | /usr/bin/grep -ioE ":[^:]+:") ; do 
-    /usr/bin/grep -m $RESULTS "$user" "$1" | /usr/bin/grep -ioE "[^:]+::.+$" | /usr/bin/tail -n 1
-done
+while IFS= read -r user; do
+    /usr/bin/grep -F -m "$RESULTS" -- "$user" "$1" | /usr/bin/grep -ioE "[^:]+::.+$" | /usr/bin/tail -n 1
+done < <(/usr/bin/grep -ioE "complete[^:]+:[^:]+:" "$1" | /usr/bin/sort -u | /usr/bin/grep -ioE ":[^:]+:")
