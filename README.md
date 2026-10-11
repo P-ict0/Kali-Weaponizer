@@ -34,7 +34,7 @@ bash weaponize.sh --plan --profile extra --guest qemu
 | **`core`** | Everyday enumeration and web tools (Nmap, FFUF, Feroxbuster, Gobuster, Burp, Firefox), VPN/network utilities, password tools, wordlists, Wireshark, tmux, Ligolo-ng, Chisel, and PEASS. |
 | **`extra`** | Everything in `core`, plus AD/Windows and lab tools (NetExec, Impacket, Certipy, Evil-WinRM, BloodHound CE, Kerbrute, Responder, Metasploit, DonPAPI, etc.), optional wireless/editor/server packages, reference repositories, and PentestManager/zsh/tmux configuration. |
 
-`extra` is the full setup. **It automatically configures the Kali user's zsh and replaces `~/.tmux.conf`** (backing up the existing file in the run logs). On `core`, shell configuration is opt-in with `--configure-shell`.
+`extra` is the full setup. **It adds the Kali user's zsh integration and installs tmux configuration only if missing.** Existing tmux settings are preserved; use `--replace-config` to back them up and replace them. On `core`, shell configuration is opt-in with `--configure-shell`.
 
 ## Useful commands
 
@@ -46,6 +46,7 @@ Run these from the cloned project directory. Replace `qemu` with `vmware`, `virt
 | Minimal VMware setup | `bash weaponize.sh --profile core --guest vmware` |
 | Install without VM guest tools | `bash weaponize.sh --profile core --guest none` |
 | Preview without installing | `bash weaponize.sh --plan --profile extra --guest qemu` |
+| Diagnose an existing installation | `bash weaponize.sh --doctor --profile extra --guest qemu` |
 | Verify existing installation | `bash weaponize.sh --verify --profile extra --guest qemu` |
 | Update selected tools | `bash weaponize.sh --update --profile extra --guest qemu` |
 | Update tools **and Kali itself** | `bash weaponize.sh --update --upgrade-system --profile extra --guest qemu` |
@@ -97,18 +98,104 @@ Follow any setup instructions about the Neo4j password. Open **http://127.0.0.1:
 | Item | Location |
 | --- | --- |
 | Standalone tools (e.g. Kerbrute, DonPAPI) | `~/tools/bin` |
+| uv tool environments | `~/tools/uv` |
+| uv/uvx bootstrap (when needed) | `~/tools/uv-bin` |
 | Reference/source repositories | `~/tools/repos` |
 | SecLists | `/usr/share/seclists` |
 | PEASS | `/usr/share/peass` |
 | Run logs, backups, package manifests | `~/.local/state/kali-weaponizer/run-*/` |
 
-With `extra` or `--configure-shell`, open a new zsh terminal to pick up `~/tools/bin` in your `PATH`. Otherwise add it yourself or use full paths.
+With `extra` or `--configure-shell`, open a new zsh terminal to pick up `~/tools/bin`, `~/tools/uv-bin` and the uv environment variables in your `PATH`. Otherwise add it yourself or use full paths.
 
 ## Troubleshooting
 
 - **Missing required APT package:** Check your Kali repositories and run `sudo apt update`. The script stops rather than silently omitting a required tool; unavailable *optional* packages are skipped with a warning.
 - **VM clipboard/display not working:** Ensure you selected the correct guest platform, then check your hypervisor's guest-agent/SPICE settings and reboot Kali if needed.
 - **A command or installation check fails:** See the latest `run.log` and `check-*.log` under `~/.local/state/kali-weaponizer/run-*/`.
-- **Upgrading a previously customized VM:** Existing tools and old configurations are not automatically removed. Review potential conflicts before changing an established setup.
+- **Existing/customized VM:** This installer assumes a fresh Kali installation. Resolve old installations and command-path conflicts separately; it does not migrate or uninstall them.
 
 For every flag, run `bash weaponize.sh --help`.
+
+## Python tools and uv
+
+Kali-packaged tools (NetExec, Impacket, Certipy, Responder, Coercer, mitm6 and the
+BloodHound CE collector) remain under **APT**. DonPAPI is the source-installed
+Python application in this version and uses **`uv tool install`**, isolated from
+system Python. There is no shared environment or blanket dependency executable exposure.
+
+Both profiles provision uv. An existing uv >= 0.9.17 is reused; otherwise the
+installer downloads **uv 0.9.17**, checks its embedded SHA-256 release digest and
+installs it into `~/tools/uv-bin`. Bootstrap supports x86_64 and aarch64; other
+architectures need a compatible uv already installed. No remote shell script is
+executed. Updating the bootstrap version requires updating both embedded hashes.
+
+DonPAPI defaults to a uv-managed Python **3.12** (downloaded when needed), independent
+of Kali's system interpreter. `DONPAPI_PYTHON=3.11 bash weaponize.sh ...` selects a
+different interpreter if you need one. Compatibility still needs validation on
+your VM; choosing an interpreter does not guarantee every dependency works.
+
+For manual management outside configured zsh, use:
+
+```bash
+export UV_TOOL_DIR="$HOME/tools/uv"
+export UV_TOOL_BIN_DIR="$HOME/tools/bin"
+export PATH="$PATH:$HOME/tools/uv-bin:$HOME/tools/bin"
+uv tool list
+```
+
+Use `--update` to refresh selected tools. A source revision change triggers a
+DonPAPI reinstall; ordinary reruns keep the existing matching environment. Source
+commits and bootstrap digests are pinned, but APT and transitive Python dependencies
+are **not fully locked**. Each run records versions, command paths and DonPAPI's
+resolved dependency list. Keep a tested VM snapshot for exact recovery.
+
+## Fresh installations
+
+This installer targets a fresh Kali VM. It does not migrate existing pipx tools,
+remove previous installations, edit APT sources or change sudo policy. Existing
+command collisions fail with a clear message rather than being overwritten.
+The `core` and `extra` profiles can be rerun; use `--update` for explicit updates.
+
+Your existing Kali repository configuration is reused, including Deb822
+`kali.sources`. No additional `.list` file is created, so a fresh run does not
+introduce the duplicate-source problem from older installers. Existing duplicate
+entries need to be resolved separately before installation.
+
+DNS, timezone and locale remain unchanged. The installer performs no broad Java,
+PostgreSQL or other package purge and no automatic `autoremove`. `--doctor` checks
+the installed tools without changing system configuration (it writes local logs).
+
+## Optional Burp and Firefox configuration
+
+Start Burp yourself, accept its licence and enable the local proxy listener. Then:
+
+```bash
+bash weaponize.sh --profile core --guest none --configure-burp
+# If BloodHound occupies 8080, configure Burp on 8081 first:
+BURP_URL=http://127.0.0.1:8081/cert bash weaponize.sh --profile extra --guest qemu --configure-burp
+```
+
+This waits up to 60 seconds for a local `/cert` endpoint, requires a parseable,
+unexpired DER CA certificate with a PortSwigger subject, and displays its SHA-256
+fingerprint. It never starts or kills Burp. It merges the Firefox template into
+existing ESR policies, retaining unrelated policies and existing scalar settings;
+certificate/extension lists are deduplicated. `--replace-config` explicitly
+replaces conflicting scalar settings after backup. The certificate is trusted by
+Firefox through its policy, not installed into the system-wide CA trust store.
+Restart Firefox and check `about:policies`. Use this only in your dedicated lab VM.
+
+## Developer checks
+
+These checks do not install tools or modify the host:
+
+```bash
+bash -n weaponize.sh
+bash -n templates/scripts/get-burp-certificate.sh
+shellcheck weaponize.sh templates/scripts/get-burp-certificate.sh
+python3 -m unittest discover -s tests -v
+bash weaponize.sh --plan --profile extra --guest qemu
+```
+
+GitHub Actions runs syntax, ShellCheck and offline regression tests. Full package
+installation, VM integrations, VPN connectivity and BloodHound import still need
+testing in a disposable Kali VM before relying on a new release.

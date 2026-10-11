@@ -11,6 +11,10 @@ EXTRAS=""
 CONFIGURE_SHELL=0
 SETUP_BLOODHOUND=0
 CHECK_BLOODHOUND=0
+CONFIGURE_BURP=0
+REPLACE_CONFIG=0
+DONPAPI_PYTHON="${DONPAPI_PYTHON:-3.12}"
+UV_VERSION=0.9.17
 UPGRADE_SYSTEM=0
 REQUIRED_PACKAGES=()
 OPTIONAL_PACKAGES=()
@@ -41,7 +45,9 @@ Usage: bash weaponize.sh [options]
   --configure-shell        Install pinned PentestManager/TPM; configure zsh/tmux.
   --update                 Upgrade selected APT tools (source pins stay fixed).
   --upgrade-system         Also full-upgrade Kali; requires --update.
-  --verify                 Check installed packages and local CLI smoke tests only.
+  --verify, --doctor       Check installed packages and local CLI smoke tests only.
+  --configure-burp         Export/validate Burp CA and merge Firefox policies.
+  --replace-config        Back up and replace conflicting tmux/Firefox settings.
   --verify-bloodhound       Verify mode plus local BloodHound HTTP readiness.
   --setup-bloodhound        Run interactive Kali BloodHound setup/start after install.
   --plan                   Print package selections without writes/sudo/network.
@@ -63,15 +69,17 @@ parse_args() {
                     --extras) EXTRAS="$2" ;;
                 esac
                 shift 2 ;;
-            --update|--verify|--verify-bloodhound|--plan)
+            --update|--verify|--doctor|--verify-bloodhound|--plan)
                 [[ "$MODE" == install ]] || die "Choose one action: update, verify, or plan."
                 case "$1" in
                     --update) MODE=update ;;
                     --plan) MODE=plan ;;
-                    --verify) MODE=verify ;;
+                    --verify|--doctor) MODE=verify ;;
                     --verify-bloodhound) MODE=verify; CHECK_BLOODHOUND=1 ;;
                 esac
                 shift ;;
+            --configure-burp) CONFIGURE_BURP=1; shift ;;
+            --replace-config) REPLACE_CONFIG=1; shift ;;
             --upgrade-system) UPGRADE_SYSTEM=1; shift ;;
             --setup-bloodhound) SETUP_BLOODHOUND=1; shift ;;
             --configure-shell) CONFIGURE_SHELL=1; shift ;;
@@ -91,6 +99,9 @@ parse_args() {
         done
     fi
     (( ! UPGRADE_SYSTEM )) || [[ "$MODE" == update ]] || die "--upgrade-system requires --update"
+    if [[ "$MODE" == verify ]] && (( CONFIGURE_BURP || REPLACE_CONFIG )); then
+        die "Configuration flags cannot be used with --verify/--doctor."
+    fi
     (( ! SETUP_BLOODHOUND )) || [[ "$MODE" == install || "$MODE" == update ]] || die "Setup cannot run in read-only modes"
 }
 
@@ -130,7 +141,7 @@ select_options() {
 
 build_package_lists() {
     REQUIRED_PACKAGES=(
-        ca-certificates curl wget git unzip build-essential python3 python3-venv pipx
+        ca-certificates curl wget git unzip build-essential python3 python3-venv openssl
         nmap ncat smbclient enum4linux-ng exploitdb gobuster feroxbuster ffuf
         burpsuite firefox-esr nikto openvpn iproute2 dnsutils net-tools
         socat proxychains4 openssh-client john hydra hashcat wordlists seclists
@@ -173,6 +184,10 @@ show_plan() {
     [[ "$PROFILE" != extra ]] || printf 'Pinned DonPAPI: %s\n' "$DONPAPI_REV"
     if (( CONFIGURE_SHELL )); then printf 'Pinned PentestManager/TPM; zsh and tmux configuration enabled.\n'; fi
     if has_extra references; then printf 'Pinned PayloadsAllTheThings, SharpCollection and username-anarchy enabled.\n'; fi
+    if (( CONFIGURE_BURP )); then printf 'Merge Firefox policies and trust CA from your running local Burp instance.\n'; fi
+    if (( REPLACE_CONFIG )); then printf 'Back up and replace conflicting selected configuration.\n'; fi
+    printf 'uv >= %s (reuse existing or install checksum-pinned bootstrap).\n' "$UV_VERSION"
+    printf 'Fresh-install provisioning; preserve DNS, APT sources and sudo policy.\n'
     return 0
 }
 
@@ -265,20 +280,98 @@ install_kerbrute() {
     sha256sum "$HOME/tools/bin/kerbrute" >> "$RUN_DIR/binaries.sha256"
 }
 
-install_donpapi() {
-    local dest="$HOME/tools/repos/donpapi-pinned"
-    local marker="$PIPX_HOME/.weaponizer-donpapi-revision"
-    checkout_pinned https://github.com/login-securite/DonPAPI.git "$dest" "$DONPAPI_REV"
-    # An isolated environment; no system Python modifications.
-    # --force is confined to this application's environment, never --include-deps.
-    if [[ "$MODE" == install && -x "$PIPX_BIN_DIR/DonPAPI" && -f "$marker" ]] &&
-        [[ "$(cat "$marker")" == "$DONPAPI_REV" ]]; then
-        info "Keeping the installed DonPAPI environment; use --update to refresh it."
-    else
-        pipx install --force "$dest"
-        printf '%s\n' "$DONPAPI_REV" > "$marker"
+# Bootstrap a checksum-pinned uv only when an adequate existing uv is unavailable.
+uv_usable() {
+    local version
+    version="$("$1" --version)" || return 1
+    python3 - "$version" <<'PYUV'
+import re, sys
+m = re.match(r"uv (\d+)\.(\d+)\.(\d+)", sys.argv[1])
+sys.exit(0 if m and tuple(map(int, m.groups())) >= (0, 9, 17) else 1)
+PYUV
+}
+
+ensure_uv() {
+    local candidate asset digest temp
+    candidate="$(command -v uv || true)"
+    if [[ -n "$candidate" ]] && uv_usable "$candidate"; then
+        UV_BIN="$candidate"
+        return
     fi
-    pipx runpip donpapi freeze > "$RUN_DIR/donpapi-python-freeze.txt"
+    if [[ -x "$HOME/tools/uv-bin/uv" ]] && uv_usable "$HOME/tools/uv-bin/uv"; then
+        UV_BIN="$HOME/tools/uv-bin/uv"
+        return
+    fi
+    case "$(uname -m)" in
+        x86_64)
+            asset=uv-x86_64-unknown-linux-gnu
+            digest=0114d54f9aafd07516cf1cadfe72afa970f5fd293fbe82dd924b8a7b42c984d8 ;;
+        aarch64|arm64)
+            asset=uv-aarch64-unknown-linux-gnu
+            digest=e9eba97b7169e47fd3c926e409f0b714820f0befc23b3ae062780586a793e4cc ;;
+        *) die "Install uv >= $UV_VERSION for this architecture, then rerun." ;;
+    esac
+    temp="$(mktemp -d "$RUN_DIR/uv-download-XXXXXX")"
+    curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 --max-time 300 \
+        "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$asset.tar.gz" -o "$temp/uv.tar.gz"
+    printf '%s  %s\n' "$digest" "$temp/uv.tar.gz" | sha256sum -c -
+    tar -xzf "$temp/uv.tar.gz" -C "$temp" "$asset/uv" "$asset/uvx"
+    mkdir -p "$HOME/tools/uv-bin"
+    install -m 755 "$temp/$asset/uv" "$temp/$asset/uvx" "$HOME/tools/uv-bin/"
+    UV_BIN="$HOME/tools/uv-bin/uv"
+    uv_usable "$UV_BIN" || die "uv bootstrap validation failed"
+    rm -rf -- "$temp"
+}
+
+install_donpapi() {
+    local dest="$HOME/tools/repos/donpapi-pinned" marker="$UV_TOOL_DIR/.weaponizer-donpapi"
+    local expected="$DONPAPI_REV python=$DONPAPI_PYTHON" name target
+    checkout_pinned https://github.com/login-securite/DonPAPI.git "$dest" "$DONPAPI_REV"
+    ensure_uv
+    for name in DonPAPI donpapi dpp; do
+        if [[ -e "$UV_TOOL_BIN_DIR/$name" || -L "$UV_TOOL_BIN_DIR/$name" ]]; then
+            target="$(readlink -f "$UV_TOOL_BIN_DIR/$name" || true)"
+            [[ "$target" == "$UV_TOOL_DIR/donpapi/bin/$name" ]] || die "Executable already exists: $UV_TOOL_BIN_DIR/$name. Resolve the collision before installing."
+        fi
+    done
+    if [[ "$MODE" == install && -x "$UV_TOOL_BIN_DIR/DonPAPI" && -f "$marker" ]] &&
+        [[ "$(cat "$marker")" == "$expected" ]]; then
+        info "Keeping DonPAPI; use --update to refresh its dependencies."
+    else
+        local -a flags=()
+        [[ "$MODE" != update ]] || flags+=(--upgrade)
+        "$UV_BIN" tool install --reinstall-package donpapi --managed-python --python "$DONPAPI_PYTHON" "${flags[@]}" "$dest"
+    fi
+    timeout 30 "$UV_TOOL_BIN_DIR/DonPAPI" -h > "$RUN_DIR/donpapi-install.log" 2>&1
+    printf '%s\n' "$expected" > "$marker"
+    "$UV_BIN" pip freeze --python "$UV_TOOL_DIR/donpapi/bin/python" > "$RUN_DIR/donpapi-python-freeze.txt"
+}
+
+preserve_config() {
+    local source="$1" dest="$2"
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        cmp -s "$source" "$dest" && return 0
+        if (( ! REPLACE_CONFIG )); then
+            warn "Preserving $dest; use --replace-config to back up and replace it."
+            return 0
+        fi
+        [[ ! -L "$dest" ]] || die "Refusing to replace symlinked configuration: $dest"
+        cp -p -- "$dest" "$RUN_DIR/$(basename "$dest").before"
+    fi
+    cp -- "$source" "$dest"
+}
+
+configure_burp() {
+    CERT_OUT="$RUN_DIR/burpCA.der" BURP_LOG="$RUN_DIR/burp-certificate.log" \
+        bash "$SCRIPT_DIR/templates/scripts/get-burp-certificate.sh"
+    local policy=/usr/share/firefox-esr/distribution/policies.json
+    local previous="$RUN_DIR/firefox-policies.before.json" flags=()
+    if run_sudo test -f "$policy"; then run_sudo cat "$policy" > "$previous"; else printf '{"policies":{}}\n' > "$previous"; fi
+    (( ! REPLACE_CONFIG )) || flags+=(--replace)
+    python3 "$SCRIPT_DIR/scripts/merge_firefox_policies.py" "$previous" \
+        "$SCRIPT_DIR/templates/configurations/firefox/firefox_policies.json" "${flags[@]}" > "$RUN_DIR/firefox-policies.json"
+    run_sudo install -D -m 644 "$RUN_DIR/burpCA.der" /usr/share/ca-certificates/burpCA.der
+    run_sudo install -D -m 644 "$RUN_DIR/firefox-policies.json" "$policy"
 }
 
 configure_shell() {
@@ -290,14 +383,15 @@ configure_shell() {
         if [[ -f "$file" ]]; then cp -p "$file" "$RUN_DIR/$(basename "$file").before"; fi
     done
     touch "$HOME/.zshrc"
-    if ! grep -qF '# Kali Weaponizer tools path' "$HOME/.zshrc"; then
+    if ! grep -qF '# Kali Weaponizer uv tools path' "$HOME/.zshrc"; then
         cat >> "$HOME/.zshrc" <<'ZSH'
 
-# Kali Weaponizer tools path
-export PATH="$PATH:$HOME/tools/bin"
-export PIPX_HOME="$HOME/tools/pipx"
-export PIPX_BIN_DIR="$HOME/tools/bin"
-export PIPX_MAN_DIR="$HOME/tools/pipx/man"
+# Kali Weaponizer uv tools path
+# Keep Kali APT commands first; custom tools have distinct names.
+typeset -U path
+path+=("$HOME/tools/uv-bin" "$HOME/tools/bin")
+export UV_TOOL_DIR="$HOME/tools/uv"
+export UV_TOOL_BIN_DIR="$HOME/tools/bin"
 ZSH
     fi
     if ! grep -qF '# PentestManager (autoload)' "$HOME/.zshrc"; then
@@ -309,7 +403,7 @@ if [[ -o interactive ]]; then
 fi
 ZSH
     fi
-    cp "$SCRIPT_DIR/templates/configurations/tmux/tmux.conf" "$HOME/.tmux.conf"
+    preserve_config "$SCRIPT_DIR/templates/configurations/tmux/tmux.conf" "$HOME/.tmux.conf"
 }
 
 install_references() {
@@ -335,7 +429,15 @@ configure_guest() {
 }
 
 verify_installation() {
-    local pkg cmd failed=0
+    local pkg cmd failed=0 resolved
+    if command -v uv >/dev/null && uv_usable "$(command -v uv)"; then
+        uv --version > "$RUN_DIR/uv-version.txt"
+    elif [[ -x "$HOME/tools/uv-bin/uv" ]] && uv_usable "$HOME/tools/uv-bin/uv"; then
+        "$HOME/tools/uv-bin/uv" --version > "$RUN_DIR/uv-version.txt"
+        warn "Use $HOME/tools/uv-bin/uv; another uv on PATH is too old."
+    else
+        warn "uv >= $UV_VERSION is missing; install/update can provision it."; failed=1
+    fi
     local -a smoke=(nmap ffuf feroxbuster gobuster openvpn socat chisel ligolo-proxy)
     for pkg in "${REQUIRED_PACKAGES[@]}"; do
         if [[ "$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null || true)" != 'install ok installed' ]]; then
@@ -352,8 +454,16 @@ verify_installation() {
     for cmd in "${smoke[@]}"; do
         if ! command -v "$cmd" >/dev/null; then
             warn "Missing command: $cmd"; failed=1
-        elif ! timeout 30 "$cmd" -h > "$RUN_DIR/check-$cmd.log" 2>&1; then
-            warn "CLI smoke test failed: $cmd (see check-$cmd.log)"; failed=1
+        else
+            resolved="$(command -v "$cmd")"
+            printf '%s\t%s\n' "$cmd" "$resolved" >> "$RUN_DIR/command-paths.tsv"
+            if [[ -x "/usr/bin/$cmd" && "$resolved" != "/usr/bin/$cmd" && "$resolved" != "/bin/$cmd" ]]; then
+                warn "$cmd is shadowed by $resolved (Kali provides /usr/bin/$cmd)."
+                failed=1
+            fi
+            if ! timeout 30 "$cmd" -h > "$RUN_DIR/check-$cmd.log" 2>&1; then
+                warn "CLI smoke test failed: $cmd (see check-$cmd.log)"; failed=1
+            fi
         fi
     done
     if [[ ! -s /usr/share/peass/linpeas/linpeas.sh || ! -s /usr/share/peass/winpeas/winPEASany.exe ]]; then
@@ -381,12 +491,15 @@ verify_installation() {
 write_manifest() {
     {
         printf 'Timestamp: %s\nProfile: %s\nGuest: %s\nExtras: %s\n' "$(date -u +%FT%TZ)" "$PROFILE" "$VIRTUALIZATION_PLATFORM" "$EXTRAS"
-        printf 'Installer HEAD: '; git -C "$SCRIPT_DIR" rev-parse HEAD
+        printf 'Installer HEAD: '; git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || printf 'unavailable (archive install)\n'
         printf 'Installer SHA256: '; sha256sum "$SCRIPT_DIR/weaponize.sh"
         uname -srmo
     } > "$RUN_DIR/environment.txt"
     dpkg-query -W -f='${binary:Package}\t${Version}\t${Status}\n' > "$RUN_DIR/apt-packages.tsv"
-    pipx list --json > "$RUN_DIR/pipx.json"
+    if [[ -n "${UV_BIN:-}" ]]; then
+        "$UV_BIN" --version > "$RUN_DIR/uv-version.txt"
+        "$UV_BIN" tool list > "$RUN_DIR/uv-tools.txt"
+    fi
     if (( ${#SKIPPED_PACKAGES[@]} )); then printf '%s\n' "${SKIPPED_PACKAGES[@]}" > "$RUN_DIR/skipped-apt-packages.txt"; fi
 }
 
@@ -397,8 +510,8 @@ main() {
     show_plan
     [[ "$MODE" != plan ]] || return 0
     require_kali_user
-    export PATH="$PATH:$HOME/tools/bin"
-    export PIPX_HOME="$HOME/tools/pipx" PIPX_BIN_DIR="$HOME/tools/bin" PIPX_MAN_DIR="$HOME/tools/pipx/man"
+    export PATH="$PATH:$HOME/tools/uv-bin:$HOME/tools/bin"
+    export UV_TOOL_DIR="$HOME/tools/uv" UV_TOOL_BIN_DIR="$HOME/tools/bin"
     local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/kali-weaponizer"
     mkdir -p "$state_dir"
     RUN_DIR="$(mktemp -d "$state_dir/run-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
@@ -410,6 +523,7 @@ main() {
         info "Local verification passed. Logs: $RUN_DIR"
         return 0
     fi
+    command -v python3 >/dev/null || die "python3 is required for repository preflight (provided by standard Kali)."
     sudo -v
     info "Refreshing existing APT sources (DNS and repository configuration are preserved)"
     run_sudo apt-get -o APT::Update::Error-Mode=any update
@@ -418,7 +532,8 @@ main() {
         run_sudo env DEBIAN_FRONTEND=noninteractive apt-get --no-remove full-upgrade -y
     fi
     install_packages
-    mkdir -p "$HOME/tools/bin" "$HOME/tools/repos" "$HOME/tools/pipx/man"
+    mkdir -p "$HOME/tools/bin" "$HOME/tools/repos" "$UV_TOOL_DIR"
+    ensure_uv
     if [[ "$PROFILE" != core ]]; then install_kerbrute; fi
     if [[ "$PROFILE" == extra ]]; then
         install_donpapi
@@ -427,6 +542,7 @@ main() {
     if has_extra references; then install_references; fi
     if (( CONFIGURE_SHELL )); then configure_shell; fi
     configure_guest
+    if (( CONFIGURE_BURP )); then configure_burp; fi
     if [[ -f /usr/share/wordlists/rockyou.txt.gz && ! -f /usr/share/wordlists/rockyou.txt ]]; then
         run_sudo gzip -dk /usr/share/wordlists/rockyou.txt.gz
     fi
