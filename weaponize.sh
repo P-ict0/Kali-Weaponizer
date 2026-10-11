@@ -22,8 +22,8 @@ SKIPPED_PACKAGES=()
 NO_PROGRESS=0
 UI_TTY=0
 UI_COLOR=0
-UI_FOOTER=0
-SPINNER_PID=""
+LOGGER_PID=""
+PROGRESS_STATE=""
 CURRENT_TASK="startup"
 TASK_NUMBER=0
 TASK_STARTED=0
@@ -58,8 +58,11 @@ warn() { printf '%s[!]%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
 die() { printf '%s[!]%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 
 section() {
-    local line width=78
-    if (( UI_TTY )); then width="$(tput cols 2>/dev/null || printf 78)"; fi
+    local line width=78 dimensions
+    if (( UI_TTY )); then
+        dimensions="$(stty size <&"$UI_FD" 2>/dev/null || printf '24 78')"
+        width="${dimensions##* }"
+    fi
     [[ "$width" =~ ^[0-9]+$ ]] || width=78
     (( width > 120 )) && width=120
     (( width > 1 )) || width=2
@@ -69,56 +72,30 @@ section() {
     printf '%s%s%s\n' "$GREEN" "${line// /#}" "$RESET"
 }
 
+start_logging() {
+    command -v python3 >/dev/null || die "python3 is required (provided by standard Kali)."
+    PROGRESS_STATE="$RUN_DIR/progress.state"
+    : > "$PROGRESS_STATE"
+    exec {LOG_OUTPUT_FD}>&1
+    # One process owns both command output and the status line. A second writer
+    # (tee + spinner) can interleave cursor operations and corrupt the display.
+    exec > >(python3 -u "$SCRIPT_DIR/scripts/progress_output.py" \
+        --log "$RUN_DIR/run.log" --state "$PROGRESS_STATE" \
+        --progress "$((UI_TTY && ! NO_PROGRESS))" --color "$UI_COLOR") 2>&1
+    LOGGER_PID=$!
+}
+
 stop_progress() {
-    if [[ -n "$SPINNER_PID" ]]; then
-        kill "$SPINNER_PID" 2>/dev/null || true
-        wait "$SPINNER_PID" 2>/dev/null || true
-        SPINNER_PID=""
-    fi
-    if (( UI_FOOTER )); then
-        # Reset scrolling margins even after failure, Ctrl-C or terminal resize.
-        printf '\0337\033[r\033[999;1H\033[2K\0338' >&"$UI_FD"
-        UI_FOOTER=0
+    if [[ -n "$PROGRESS_STATE" ]]; then
+        : > "$PROGRESS_STATE.next"
+        mv -f -- "$PROGRESS_STATE.next" "$PROGRESS_STATE"
     fi
 }
 
 start_progress() {
-    (( UI_TTY && ! NO_PROGRESS )) || return 0
-    # Only terminals with a known VT-compatible scrolling region get a footer.
-    case "${TERM:-dumb}" in xterm*|screen*|tmux*|rxvt*|linux|vt100|vt220|ansi) ;; *) return 0 ;; esac
-    local rows cols
-    rows="$(env -u LINES -u COLUMNS tput lines 2>/dev/null || printf 24)"
-    cols="$(env -u LINES -u COLUMNS tput cols 2>/dev/null || printf 80)"
-    [[ "$rows" =~ ^[0-9]+$ && "$cols" =~ ^[0-9]+$ ]] || return 0
-    (( rows >= 4 && cols >= 20 )) || return 0
-    UI_FOOTER=1
-    # Keep the output cursor inside the scroll region, including when the prior
-    # command left it on the terminal's last row. Do this before starting work.
-    printf '\n\033[1;%sr\033[%s;1H' "$((rows - 1))" "$((rows - 1))" >&"$UI_FD"
-    (
-        trap - ERR EXIT
-        trap 'exit 0' INT TERM
-        local old_rows=$rows frame=0 text elapsed
-        local -a frames=('|' '/' '-' $'\\')
-        while :; do
-            rows="$(env -u LINES -u COLUMNS tput lines 2>/dev/null || printf 24)"
-            cols="$(env -u LINES -u COLUMNS tput cols 2>/dev/null || printf 80)"
-            [[ "$rows" =~ ^[0-9]+$ && "$cols" =~ ^[0-9]+$ ]] || break
-            (( rows >= 4 && cols >= 20 )) || break
-            if (( rows != old_rows )); then
-                printf '\033[r\n\033[1;%sr\033[%s;1H' "$((rows - 1))" "$((rows - 1))" >&"$UI_FD"
-                old_rows=$rows
-            fi
-            elapsed=$((SECONDS - TASK_STARTED))
-            printf -v text ' [%s] Step %s | %s | %02d:%02d elapsed' \
-                "${frames[frame % 4]}" "$TASK_NUMBER" "$CURRENT_TASK" "$((elapsed / 60))" "$((elapsed % 60))"
-            printf '\0337\033[%s;1H\033[2K%s%.*s%s\0338' \
-                "$rows" "$CYAN" "$((cols - 1))" "$text" "$RESET" >&"$UI_FD"
-            frame=$((frame + 1))
-            sleep 0.2
-        done
-    ) &
-    SPINNER_PID=$!
+    [[ -n "$PROGRESS_STATE" ]] || return 0
+    printf '%s\t%s\n' "$TASK_NUMBER" "$CURRENT_TASK" > "$PROGRESS_STATE.next"
+    mv -f -- "$PROGRESS_STATE.next" "$PROGRESS_STATE"
 }
 
 run_task() {
@@ -139,6 +116,16 @@ cleanup_ui() {
     stop_progress
     if (( status != 0 )); then
         warn "Stopped during: $CURRENT_TASK (exit $status). Logs: ${RUN_DIR:-not started}"
+    fi
+    if [[ -n "$LOGGER_PID" ]]; then
+        # Close the pipe before waiting so the renderer can flush and clear its
+        # final status line. This also makes logs complete when the script exits.
+        exec 1>&"$LOG_OUTPUT_FD" 2>&1
+        if ! wait "$LOGGER_PID"; then
+            warn "Output logger failed; check $RUN_DIR/run.log."
+            (( status != 0 )) || status=1
+        fi
+        LOGGER_PID=""
     fi
     return "$status"
 }
@@ -681,11 +668,7 @@ main() {
     mkdir -p "$state_dir"
     RUN_DIR="$(mktemp -d "$state_dir/run-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
     export RUN_DIR
-    if (( UI_COLOR )); then
-        exec > >(tee >(sed -u $'s/\033\\[[0-9;]*m//g' > "$RUN_DIR/run.log")) 2>&1
-    else
-        exec > >(tee "$RUN_DIR/run.log") 2>&1
-    fi
+    start_logging
     trap cleanup_ui EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM

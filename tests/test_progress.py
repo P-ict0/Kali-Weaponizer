@@ -1,6 +1,7 @@
 """Package preflight, workflow and real PTY regressions; never install on the host."""
 import errno
 import fcntl
+import io
 import os
 import pty
 import select
@@ -8,10 +9,55 @@ import struct
 import subprocess
 import termios
 import time
+import tempfile
 import unittest
+from unittest.mock import patch
 import test_installer
 
 ROOT = test_installer.ROOT
+progress_output = test_installer.module('progress_output')
+
+
+class FakeTerminal(io.StringIO):
+    def isatty(self):
+        return True
+
+    def fileno(self):
+        return 1
+
+
+class OutputRenderer(unittest.TestCase):
+    def test_partial_prompt_suspends_status_until_newline(self):
+        stream = FakeTerminal()
+        display = progress_output.Display(stream, True, False)
+        with patch.object(progress_output.os, 'get_terminal_size', return_value=os.terminal_size((80, 40))):
+            display.refresh('1\tExample')
+            display.write('Enter a value: ')
+            before = stream.getvalue()
+            display.refresh('1\tExample')
+            self.assertEqual(stream.getvalue(), before)
+            display.write('done\n')
+            display.refresh('1\tExample')
+            self.assertIn('elapsed', stream.getvalue()[len(before):])
+
+    def test_resize_clears_wrapped_status_and_uses_actual_width(self):
+        stream = FakeTerminal()
+        display = progress_output.Display(stream, True, False)
+        with patch.object(progress_output.os, 'get_terminal_size', return_value=os.terminal_size((100, 50))):
+            display.refresh('1\tInstall selected APT packages')
+        with patch.object(progress_output.os, 'get_terminal_size', return_value=os.terminal_size((40, 20))):
+            display.refresh('1\tInstall selected APT packages')
+        self.assertIn('\x1b[1A', stream.getvalue())
+        self.assertLess(display.drawn_length, 40)
+        self.assertNotRegex(stream.getvalue(), r'\x1b\[[0-9;]*[rH]')
+
+    def test_pipe_output_is_plain_text(self):
+        stream = io.StringIO()
+        display = progress_output.Display(stream, True, True)
+        display.refresh('1\tExample')
+        display.write('output\n')
+        display.clear()
+        self.assertEqual(stream.getvalue(), 'output\n')
 
 
 class Workflow(unittest.TestCase):
@@ -67,7 +113,7 @@ echo SHOULD_NOT_RUN
     def test_plain_task_has_no_ansi_or_background_process(self):
         result = self.run_shell('''init_ui
 run_task 'Example' printf 'command output\\n'
-[[ -z "$SPINNER_PID" ]]
+[[ -z "$LOGGER_PID" ]]
 ''')
         self.assertNotIn('\x1b', result.stdout + result.stderr)
         self.assertIn('Completed: Example', result.stdout)
@@ -110,25 +156,31 @@ fi
 
 
 class TerminalUI(unittest.TestCase):
-    def terminal_run(self, ending, env_extra=None, no_progress=False):
+    def terminal_run(self, ending, env_extra=None, no_progress=False, resize=False):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 100, 0, 0))
         env = dict(os.environ, TERM='xterm-256color')
         env.pop('NO_COLOR', None)
         env.update(env_extra or {})
+        temp = tempfile.TemporaryDirectory()
         code = '''source "$1/weaponize.sh"
 NO_PROGRESS="${2:-0}"
 init_ui
+RUN_DIR="$3"
+start_logging
 trap cleanup_ui EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-work() { sleep 0.4; ''' + ending + '''; }
+work() {
+    for ((n=1; n<=100; n++)); do printf 'output-line-%03d\\n' "$n"; done
+    sleep 0.6; ''' + ending + '''; }
 run_task 'Terminal test' work
 '''
-        process = subprocess.Popen(['bash', '-c', code, 'test', str(ROOT), str(int(no_progress))],
+        process = subprocess.Popen(['bash', '-c', code, 'test', str(ROOT), str(int(no_progress)), temp.name],
                                    stdin=slave, stdout=slave, stderr=slave, env=env)
         os.close(slave)
         chunks = []
+        resized = False
         deadline = time.monotonic() + 10
         try:
             while time.monotonic() < deadline:
@@ -143,13 +195,22 @@ run_task 'Terminal test' work
                 if not data:
                     break
                 chunks.append(data)
+                if resize and not resized and b'elapsed' in data:
+                    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 45, 0, 0))
+                    resized = True
             status = process.wait(timeout=2)
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait()
             os.close(master)
-        return status, b''.join(chunks).decode()
+        output = b''.join(chunks).decode()
+        log = (test_installer.Path(temp.name) / 'run.log').read_text()
+        temp.cleanup()
+        self.assertNotIn('\x1b', log)
+        for number in range(1, 101):
+            self.assertEqual(log.count(f'output-line-{number:03d}\n'), 1)
+        return status, output
 
     def test_footer_cleanup_on_success_failure_and_interrupt(self):
         for ending, expected in [('true', 0), ('false', 1), ('kill -INT $$', 130), ('kill -TERM $$', 143)]:
@@ -157,8 +218,8 @@ run_task 'Terminal test' work
                 status, output = self.terminal_run(ending)
                 self.assertEqual(status, expected, output)
                 self.assertIn('elapsed', output)
-                self.assertIn('\x1b[1;23r', output)
-                self.assertIn('\x1b[r', output)
+                self.assertNotRegex(output, r'\x1b\[[0-9;]*[rH]')
+                self.assertIn('\r\x1b[2K', output)
                 if expected:
                     self.assertNotIn('Completed:', output)
 
@@ -174,6 +235,12 @@ run_task 'Terminal test' work
         self.assertNotIn('elapsed', output)
         self.assertNotIn('\x1b[1;23r', output)
         self.assertIn('\x1b[1;32m', output)
+
+    def test_live_output_with_resize_and_stale_dimensions(self):
+        status, output = self.terminal_run('true', {'LINES': '10', 'COLUMNS': '20'}, resize=True)
+        self.assertEqual(status, 0, output)
+        self.assertIn('Completed: Terminal test', output)
+        self.assertNotRegex(output, r'\x1b\[[0-9;]*[rH]')
 
 
 if __name__ == '__main__':

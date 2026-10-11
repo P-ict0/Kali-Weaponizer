@@ -28,11 +28,12 @@ bash weaponize.sh --plan --profile extra --guest qemu
 `--plan` makes no changes and downloads nothing.
 
 The interactive display uses green section dividers, cyan prompts, yellow warnings
-and red errors. A bottom status line shows the current task, spinner and elapsed
-time while command output continues above it. There are no artificial delays or
+and red errors. A status line below the latest output shows the current task, spinner and elapsed
+time. One renderer serializes command output and progress updates; it does not
+reserve terminal rows or change scrolling margins. There are no artificial delays or
 estimated percentages. Use `--no-progress` to disable the footer, or `NO_COLOR=1`
-to disable colours. Redirected output and run logs stay plain text. The footer is
-restored on success, failure and Ctrl-C; small or unsupported terminals use normal
+to disable colours. Redirected output and run logs stay plain text. The status line is
+cleared on success, failure and Ctrl-C; small or unsupported terminals use normal
 step messages instead.
 
 ## Choose a profile
